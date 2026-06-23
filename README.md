@@ -4,7 +4,7 @@
 Mathematical Reinforcement Learning* (ICML 2026).**
 
 - 📄 **Project page:** https://icml.cc/virtual/2026/poster/64251
-- 📝 **arXiv:** coming soon
+- 📝 **arXiv:** https://arxiv.org/abs/2606.21611
 
 AC-SolverX trains reinforcement-learning agents to trivialize balanced
 presentations of the trivial group, the search problem at the heart of the
