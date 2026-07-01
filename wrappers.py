@@ -7,6 +7,7 @@ from flax import struct
 from functools import partial
 from typing import Optional, Tuple, Union, Any
 from gymnax.environments import environment, spaces
+from envs.utils import encode_action_jax
 
 
 class GymnaxWrapper(object):
@@ -211,11 +212,10 @@ class LogPathsProbsS(GymnaxWrapper):
         current_idx = info['idx'] # (NUM_ENVS, )
         terminated = info['terminated'] # (NUM_ENVS, )
         episode_length = info['episode_length'] # (NUM_ENVS, ) # state.time coming from AC.step.
-        def encode_action(action, max_length):
-            action_i, action_j, action_k1, action_k2 = action[..., 0], action[..., 1], action[..., 2], action[..., 3]
-            return (((action_k1-1) * max_length + (action_k2+action_j)*(-1)**(action_j)) * 4) + (action_i * 2 + action_j)
-
-        encoded_action = encode_action(action, self.params.max_length)
+        encoded_action = encode_action_jax(action, self.params.max_length,
+                                           self.change_of_variables_moves,
+                                           self.ac45_moves,
+                                           max_n_gen=self.params.max_n_gen)
         # always update current actions
         new_current_actions = state.current_actions.at[
             jnp.arange(self.num_envs,), episode_length-1

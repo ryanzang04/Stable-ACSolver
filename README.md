@@ -85,11 +85,21 @@ own agent from scratch.
 
 ## Code overview
 
-A presentation is a flat `jnp.array` of length `2 * max_length`: two relators of
-`max_length` each, zero-padded (here `n_gen = 2`, so this equals the code's
-`n_gen * max_length`). The agent picks a substitution move `[i, j, k1, k2]`
-packed into a single integer action index; the goal is to reach the trivial
-presentation `<x, y | x, y>`.
+A presentation is a flat `jnp.array` of length `max_n_gen * max_length`:
+`max_n_gen` relator slots, each zero-padded to `max_length`. The environment
+tracks the active generator count separately as `state.n_gen`, so stable moves
+can add or remove generators while the observation shape stays fixed. By
+default, `max_n_gen = n_gen = 2`, preserving the released checkpoint setup.
+
+By default the environment exposes substitution supermoves. Additional action
+families are configured by explicit flags:
+
+- `change_of_variables_moves=True` enables the finite change-of-variables
+  supermove.
+- `ac45_moves=True` enables AC4 add-generator and AC5 delete-generator.
+
+For a change-of-variables run, use
+`change_of_variables_moves=True, ac45_moves=False`.
 
 ## Layout
 
@@ -97,7 +107,7 @@ presentation `<x, y | x, y>`.
 envs/                environment logic
   environment.py     gymnax base Environment (reset/step take idx, sample, probs)
   ac_s.py            ACS: the substitution environment (EnvState, step_env, reset_env)
-  ac_moves.py        substitution-move implementation (setup_s_actions)
+  ac_moves.py        substitution, AC4/AC5, and change-of-variables moves
   utils.py           presentation padding/length helpers
   int_box.py         minimal integer Box space
 network.py           RelativeDualRingActorCritic (used by PPO) and DualRingActorCritic
@@ -108,15 +118,18 @@ beam/
   beam_search.py     beam search that loads a trained checkpoint
 scripts/
   check_checkpoint_paths.py  validate stored paths in a checkpoint's solve_data
+  stable_cov_demo.py         worked AK(3) stable change-of-variables move
 data/                initial-state datasets (one Python-literal presentation per line)
 ```
 
 ## Datasets (`data/`)
 
-Each line is one presentation as a Python literal (a flat list of length
-`2 * max_length`, i.e. two zero-padded relators). Generators are encoded as
-integers: `x → 1`, `y → 2`, `x⁻¹ → -1`, `y⁻¹ → -2`, and `0` is padding.
-"Length" below means the number of nonzero entries (the total word length).
+Each line is one presentation as a Python literal. The released datasets are
+flat lists of length `2 * max_length`, i.e. two zero-padded relators. Generators
+are encoded as integers: `x → 1`, `y → 2`, `x⁻¹ → -1`, `y⁻¹ → -2`, and `0` is
+padding. "Length" below means the number of nonzero entries (the total word
+length). For custom `n`-generator data, store `n` zero-padded relator slots per
+line and instantiate `ACS(n_gen=n, max_n_gen=...)`.
 
 For example, the first line of `1190MS.txt` begins
 `[-2, -2, -1, 2, 1, 0, …]`: the first relator is `y⁻¹ y⁻¹ x⁻¹ y x`, with the rest
@@ -188,6 +201,119 @@ Key knobs are `max_nodes` (search budget) and `max_len` (the largest relator
 length the search will consider, smaller is faster). Relators are written as
 strings over `x, X, y, Y` (where `X = x⁻¹`, `Y = y⁻¹`).
 
+## Optional Stable Moves
+
+The move families are:
+
+- **Change of variables**: choose a cyclic subword `W` in one relator,
+  introduce `z = W` (or `z = W^-1`), use the complementary part of that relator
+  to isolate one old generator, then remove that old generator and substitute
+  the solution into the remaining active relators and the defining relator for
+  `z`.
+- **AC4 add generator**: append a new generator `x_{n+1}` and a trivial relator
+  `x_{n+1}` when `state.n_gen < max_n_gen`.
+- **AC5 delete generator**: remove generator `x_i` when exactly one active
+  relator contains `x_i`, and that relator is the singleton `x_i` or `x_i^-1`.
+  Higher generator labels and relator slots are compacted after deletion.
+
+These actions are opt-in. For a change-of-variables run, set
+`change_of_variables_moves=True` and `ac45_moves=False`. With `M = max_n_gen`
+and `L = max_length`, generic substitution mode uses
+`M * (M - 1) * 2 * L * L` actions. The historical `M = 2` layout is kept at
+`4 * L * L` actions. `change_of_variables_moves=True` appends
+`M * M * 2 * L * L` actions. `ac45_moves=True` appends one AC4 add action and
+`M` AC5 delete actions.
+
+Programmatic usage for a generic fixed capacity:
+
+```python
+from envs.ac_s import ACS
+
+env = ACS(n_gen=3, max_n_gen=6, max_length=32,
+          max_steps_in_episode=200,
+          initial_states_file="my_3gen_dataset",
+          change_of_variables_moves=True,
+          ac45_moves=False)
+```
+
+Environment action vectors use branch IDs, not packed policy indices. AC4/AC5
+action vectors are relevant when `ac45_moves=True`:
+
+```python
+from envs.utils import add_generator_branch, delete_generator_branch
+
+M = 6
+
+# AC4 add generator
+[add_generator_branch(M, change_of_variables_moves=True), 0, 0, 0]
+
+# AC5 delete generator with zero-based generator index delete_gen
+[delete_generator_branch(M, change_of_variables_moves=True), delete_gen, 0, 0]
+```
+
+If AC4/AC5 is enabled without change-of-variables, call the branch helpers
+with `change_of_variables_moves=False`.
+
+For change-of-variables, the branch starts after the substitution branches:
+
+```python
+from envs.utils import change_of_variables_branch
+
+[change_of_variables_branch(remove_gen, iso_relator, M),
+ z_inverse, z_start, z_len - 1]
+```
+
+- `remove_gen`: zero-based generator slot to replace by the new variable `z`.
+- `iso_relator`: active relator used to isolate the old generator.
+- `z_inverse`: `0` means `z = W`; `1` means `z = W^-1`.
+- `z_start`: cyclic start index of `W` inside `iso_relator`.
+- `z_len - 1`: encoded subword length, so `z_len` ranges from `1` to `L`.
+
+Invalid stable moves leave the state unchanged. This includes trying to add
+past `max_n_gen`, trying to delete a generator that is not isolated by a
+trivial relator, choosing an inactive relator/generator, or overflowing
+`max_length` after free and cyclic reduction.
+
+Run the worked `AK(3)` example from the change-of-variables note:
+
+```bash
+python scripts/stable_cov_demo.py
+```
+
+Change-of-variables programmatic setup:
+
+```python
+from envs.ac_s import ACS
+from network import RelativeDualRingActorCritic
+
+env = ACS(n_gen=2, max_n_gen=2, max_length=24, max_steps_in_episode=150,
+          initial_states_file="AC19_extended",
+          change_of_variables_moves=True,
+          ac45_moves=False)
+network = RelativeDualRingActorCritic(activation="gelu",
+                                      change_of_variables_moves=True)
+```
+
+Pack and decode change-of-variables paths with the same flag:
+
+```python
+from envs.utils import encode_action, decode_path
+
+packed = encode_action([2, 0, 0, 2], max_length=24,
+                       change_of_variables_moves=True)
+decoded = decode_path([packed], max_length=24,
+                      change_of_variables_moves=True)
+```
+
+`RelativeDualRingActorCritic`, `ppo_ac_s.py`, and `beam/beam_search.py` remain
+two-relator model code. They explicitly require `n_gen = max_n_gen = 2`. The
+environment and move layer support general `n` and `max_n_gen`; training a
+neural policy for `n > 2` needs an `n`-relator architecture.
+
+Do not pass `--change_of_variables_moves` or `--ac45_moves` when evaluating the released `610model`: that
+checkpoint was trained with the substitution-only policy head. Train a matching
+stable policy head before running stable beam search.
+
 ## Training
 
 Run from the repository root. To train and write Orbax checkpoints (needed by
@@ -197,10 +323,20 @@ the beam search) under `ppo_checkpoints/<name>/`:
 python ppo_ac_s.py --ckpt_path my_run --save_every 50
 ```
 
-Without `--ckpt_path`, training runs but saves nothing. Useful flags:
-`--w 0` (disable wandb), `--lr`, `--ent_coef`, `--seed`, and the reward-shaping
-penalties `--cycle_penalty` / `--noop_penalty` (default `0.0`). The training
-dataset and `max_length` (`L = 24`) are set at the top of `make_train`.
+Without `--ckpt_path`, training runs but saves nothing. To train with
+change-of-variables moves in the current two-relator policy, add
+`--change_of_variables_moves`:
+
+```bash
+python ppo_ac_s.py --change_of_variables_moves --ckpt_path cov_run --save_every 50
+```
+
+AC4/AC5 remains disabled unless you add `--ac45_moves`.
+
+Useful flags: `--w 0` (disable wandb), `--lr`, `--ent_coef`, `--seed`, and the
+reward-shaping penalties `--cycle_penalty` / `--noop_penalty` (default `0.0`).
+The training dataset and `max_length` (`L = 24`) are set at the top of
+`make_train`.
 
 The network is `RelativeDualRingActorCritic` (relative-position attention,
 cyclic relators). `DualRingActorCritic` (absolute positional encoding) is
@@ -216,8 +352,16 @@ python beam/beam_search.py --ckpt_path my_run --beam_width 1024 \
     --start 0 --end 634 --out_csv beam_paths.csv
 ```
 
-The action packing/unpacking in `beam_search.py` must match `ppo_ac_s.py`
-(`L = 24`).
+For checkpoints trained with change-of-variables moves, pass the same flag:
+
+```bash
+python beam/beam_search.py --change_of_variables_moves --ckpt_path cov_run \
+    --beam_width 1024 --start 0 --end 634 --out_csv cov_beam_paths.csv
+```
+
+Beam search checks the saved training config and exits if the
+move-family flags do not match the checkpoint. The action packing/unpacking in
+`beam_search.py` must match `ppo_ac_s.py` (`L = 24`).
 
 ## Pretrained checkpoint
 

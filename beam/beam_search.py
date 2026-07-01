@@ -28,6 +28,7 @@ import jax.numpy as jnp
 import orbax.checkpoint as ocp
 from envs.ac_s import ACS
 from network import RelativeDualRingActorCritic
+from envs.utils import decode_action_jax, decode_path as decode_packed_path
 
 jax.config.update("jax_default_matmul_precision", "float32")
 
@@ -55,6 +56,18 @@ def parse_args():
                    help="Gumbel noise scale at t=max_steps-1 (linear schedule)")
     p.add_argument("--max_steps", type=int, default=150)
     p.add_argument("--activation", type=str, default="gelu")
+    p.add_argument("--change_of_variables_moves", action="store_true",
+                   help="enable the change-of-variables action head; "
+                        "must match the checkpoint training config")
+    p.add_argument("--ac45_moves", action="store_true",
+                   help="enable AC4/AC5 action head; must match the checkpoint "
+                        "training config")
+    p.add_argument("--stable_ac_moves", action="store_true",
+                   help="deprecated alias for enabling both "
+                        "--change_of_variables_moves and --ac45_moves")
+    p.add_argument("--max_n_gen", type=int, default=2,
+                   help="maximum generator capacity; beam search with the "
+                        "two-ring checkpoint architecture currently supports only 2")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out_csv", type=str, default="beam_paths.csv")
     return p.parse_args()
@@ -63,13 +76,28 @@ def parse_args():
 def main():
     args = parse_args()
     print(f"JAX devices: {jax.devices()}")
+    if args.max_n_gen != 2:
+        raise SystemExit(
+            "beam/beam_search.py uses the two-ring transformer and currently "
+            "requires --max_n_gen 2. Use envs.ac_s.ACS directly for generic "
+            "n-generator stable AC moves."
+        )
+    change_of_variables_moves = args.change_of_variables_moves or args.stable_ac_moves
+    ac45_moves = args.ac45_moves or args.stable_ac_moves
 
     L = 24  # max_length; the ACS action-packing constant
-    env = ACS(n_gen=2, max_length=L, max_steps_in_episode=args.max_steps,
+    env = ACS(n_gen=2, max_n_gen=args.max_n_gen,
+              max_length=L, max_steps_in_episode=args.max_steps,
               is_reward_sparse=False,
-              initial_states_file=args.dataset)
+              initial_states_file=args.dataset,
+              change_of_variables_moves=change_of_variables_moves,
+              ac45_moves=ac45_moves)
     env_params = env.default_params
-    network = RelativeDualRingActorCritic(activation=args.activation)
+    network = RelativeDualRingActorCritic(
+        activation=args.activation,
+        change_of_variables_moves=change_of_variables_moves,
+        ac45_moves=ac45_moves,
+    )
     n_actions = env.num_actions
     B = args.beam_width
     T = args.max_steps
@@ -102,6 +130,21 @@ def main():
         step_to_load,
         args=ocp.args.Composite(config=ocp.args.JsonRestore({})),
     )
+    ckpt_cov = bool(cfg_restored.config.get(
+        "CHANGE_OF_VARIABLES_MOVES",
+        cfg_restored.config.get("STABLE_AC_MOVES", False),
+    ))
+    ckpt_ac45 = bool(cfg_restored.config.get(
+        "AC45_MOVES",
+        cfg_restored.config.get("STABLE_AC_MOVES", False),
+    ))
+    if ckpt_cov != change_of_variables_moves or ckpt_ac45 != ac45_moves:
+        raise SystemExit(
+            "Checkpoint move flags do not match beam flags: "
+            f"checkpoint CHANGE_OF_VARIABLES_MOVES={ckpt_cov}, AC45_MOVES={ckpt_ac45}; "
+            f"requested CHANGE_OF_VARIABLES_MOVES={change_of_variables_moves}, "
+            f"AC45_MOVES={ac45_moves}."
+        )
     train_num_steps = int(cfg_restored.config["NUM_STEPS"])
 
     dummy_solve_data = {
@@ -177,15 +220,10 @@ def main():
         parent = top_idx // n_actions
         flat_action = top_idx % n_actions
 
-        # Decode flat_action -> (i, j, k1, k2). Must match ppo_ac_s.py exactly.
-        action_k1 = (flat_action // (4 * L)) + 1
-        rem = flat_action % (4 * L)
-        action_k2_tmp = rem // 4
-        ij = rem % 4
-        action_i = ij // 2
-        action_j = ij % 2
-        action_k2 = action_k2_tmp * (-1) ** action_j - action_j
-        action_vec = jnp.stack([action_i, action_j, action_k1, action_k2], axis=-1)  # (B, 4)
+        action_vec = decode_action_jax(
+            flat_action, L, change_of_variables_moves, ac45_moves,
+            max_n_gen=args.max_n_gen
+        )
 
         parent_states = jax.tree.map(lambda v: v[parent], states)
         step_rngs = jax.random.split(step_rng, B)
@@ -241,18 +279,12 @@ def main():
                 terminated, new_visited_sorted, rng)
 
     def decode_path(flat_actions):
-        out = []
-        for a in flat_actions:
-            a = int(a)
-            k1 = (a // (4 * L)) + 1
-            rem = a % (4 * L)
-            k2_tmp = rem // 4
-            ij = rem % 4
-            i = ij // 2
-            j = ij % 2
-            k2 = k2_tmp * ((-1) ** j) - j
-            out.append([i, j, k1, k2])
-        return out
+        return decode_packed_path(
+            flat_actions, L,
+            change_of_variables_moves=change_of_variables_moves,
+            ac45_moves=ac45_moves,
+            max_n_gen=args.max_n_gen,
+        )
 
     results = []
     t0 = time.time()

@@ -20,6 +20,21 @@ from flax.linen.initializers import orthogonal, constant
 jax.config.update("jax_default_matmul_precision", "float32")
 
 
+def _stable_change_of_variables_mask(mask1, mask2):
+    """Mask finite change-of-variables windows with nonempty complements."""
+    B, L = mask1.shape
+    lengths = jnp.stack([mask1.sum(axis=1), mask2.sum(axis=1)], axis=1)
+    starts = jnp.arange(L)[None, :, None]
+    z_lens = (jnp.arange(L) + 1)[None, None, :]
+    channel_masks = []
+    for branch in range(4):
+        iso_relator = branch % 2
+        rel_len = lengths[:, iso_relator][:, None, None]
+        valid = (starts < rel_len) & (z_lens < rel_len)
+        channel_masks.extend([valid, valid])
+    return jnp.stack(channel_masks, axis=-1)
+
+
 # ---------------------------------------------------------------------------
 # Relative-position attention (cyclic) building blocks
 # ---------------------------------------------------------------------------
@@ -54,7 +69,7 @@ class RelativeSelfAttention(nn.Module):
         rel_emb = self.param("rel_emb", nn.initializers.normal(stddev=0.02), (H, L, Dh))
 
         # Compute effective lengths per batch
-        lengths = mask.sum(axis=1)  # [B]
+        lengths = jnp.maximum(mask.sum(axis=1), 1)  # [B]
 
         # Compute cyclic distances for each batch: [B,L,L]
         rel_dist = self.base_rel_dist[None, :, :] % lengths[:, None, None]
@@ -172,6 +187,9 @@ class RelativeDualRingActorCritic(nn.Module):
     embedding_dim: int = num_heads * head_dim
     vocab_size: int = 5
     max_len: int = 24
+    stable_ac_moves: bool = False
+    change_of_variables_moves: bool = False
+    ac45_moves: bool = False
 
     @nn.compact
     def __call__(self, input_seq):
@@ -243,7 +261,7 @@ class RelativeDualRingActorCritic(nn.Module):
         x_joint = nn.Dense(128, kernel_init=orthogonal(jnp.sqrt(2)))(x_joint)
         x_joint = act_fn(x_joint)
 
-        # Output logits for all actions (j_type * k1 * k2)
+        # Output logits for substitution actions (j_type * k1 * k2)
         logits = nn.Dense(4, kernel_init=orthogonal(0.01))(x_joint)  # [B, L_half, L_half, 4] k1, k2, ij
 
         # flatten to [B, total_action_dim]; sample = ((k1 * L_half + k2) * 4) + (i * 2 + j), so j is the last index
@@ -251,6 +269,20 @@ class RelativeDualRingActorCritic(nn.Module):
 
         # Mask invalid logits with -1e9
         logits_flat = jnp.where(final_mask.reshape(B, -1), logits_flat, -1e9)
+
+        cov_enabled = self.change_of_variables_moves or self.stable_ac_moves
+        ac45_enabled = self.ac45_moves or self.stable_ac_moves
+        if cov_enabled:
+            stable_logits = nn.Dense(8, kernel_init=orthogonal(0.01))(x_joint)
+            stable_mask = _stable_change_of_variables_mask(mask1, mask2)
+            stable_logits = jnp.where(stable_mask, stable_logits, -1e9)
+            logits_flat = jnp.concatenate(
+                [logits_flat, stable_logits.reshape(B, -1)],
+                axis=-1,
+            )
+        if ac45_enabled:
+            generator_logits = nn.Dense(3, kernel_init=orthogonal(0.01))(joint)
+            logits_flat = jnp.concatenate([logits_flat, generator_logits], axis=-1)
 
         # Distribution over all actions (i, j, j_type, k1, k2)
         pi = distrax.Categorical(logits=logits_flat)
@@ -388,6 +420,9 @@ class DualRingActorCritic(nn.Module):
     embedding_dim: int = num_heads * head_dim
     vocab_size: int = 5
     max_len: int = 32
+    stable_ac_moves: bool = False
+    change_of_variables_moves: bool = False
+    ac45_moves: bool = False
 
     @nn.compact
     def __call__(self, input_seq):
@@ -459,7 +494,7 @@ class DualRingActorCritic(nn.Module):
         x_joint = nn.Dense(128, kernel_init=orthogonal(jnp.sqrt(2)))(x_joint)
         x_joint = act_fn(x_joint)
 
-        # Output logits for all actions (j_type * k1 * k2)
+        # Output logits for substitution actions (j_type * k1 * k2)
         logits = nn.Dense(4, kernel_init=orthogonal(0.01))(x_joint)  # [B, L_half, L_half, 4] k1, k2, ij
 
         # flatten to [B, total_action_dim]; sample = ((k1 * L_half + k2) * 4) + (i * 2 + j), so j is the last index
@@ -467,6 +502,20 @@ class DualRingActorCritic(nn.Module):
 
         # Mask invalid logits with -1e9
         logits_flat = jnp.where(final_mask.reshape(B, -1), logits_flat, -1e9)
+
+        cov_enabled = self.change_of_variables_moves or self.stable_ac_moves
+        ac45_enabled = self.ac45_moves or self.stable_ac_moves
+        if cov_enabled:
+            stable_logits = nn.Dense(8, kernel_init=orthogonal(0.01))(x_joint)
+            stable_mask = _stable_change_of_variables_mask(mask1, mask2)
+            stable_logits = jnp.where(stable_mask, stable_logits, -1e9)
+            logits_flat = jnp.concatenate(
+                [logits_flat, stable_logits.reshape(B, -1)],
+                axis=-1,
+            )
+        if ac45_enabled:
+            generator_logits = nn.Dense(3, kernel_init=orthogonal(0.01))(joint)
+            logits_flat = jnp.concatenate([logits_flat, generator_logits], axis=-1)
 
         # Distribution over all actions (i, j, j_type, k1, k2)
         pi = distrax.Categorical(logits=logits_flat)

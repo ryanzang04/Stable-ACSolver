@@ -61,6 +61,16 @@ def main():
     # NUM_STEPS sizes the best_paths width.
     cfg = mngr.restore(step, args=ocp.args.Composite(config=ocp.args.JsonRestore({})))
     num_steps = int(cfg.config["NUM_STEPS"])
+    change_of_variables_moves = bool(cfg.config.get(
+        "CHANGE_OF_VARIABLES_MOVES",
+        cfg.config.get("STABLE_AC_MOVES", False),
+    ))
+    ac45_moves = bool(cfg.config.get(
+        "AC45_MOVES",
+        cfg.config.get("STABLE_AC_MOVES", False),
+    ))
+    n_gen = int(cfg.config.get("N_GEN", 2))
+    max_n_gen = int(cfg.config.get("MAX_N_GEN", n_gen))
 
     dummy_solve_data = {
         "solved_idx": jnp.zeros(num_states, dtype=jnp.bool_),
@@ -73,7 +83,10 @@ def main():
     )
     sd = restored.solve_data
     n_solved = int(jnp.count_nonzero(sd["solved_idx"]))
-    print(f"checkpoint reports {n_solved} solved presentations")
+    print(f"checkpoint reports {n_solved} solved presentations "
+          f"(change_of_variables_moves={change_of_variables_moves}, "
+          f"ac45_moves={ac45_moves}, n_gen={n_gen}, "
+          f"max_n_gen={max_n_gen})")
 
     max_paths = None if args.max_paths < 0 else args.max_paths
     failures = check_paths(
@@ -81,6 +94,10 @@ def main():
         initial_states_file=args.dataset,
         max_length=args.max_length,
         max_paths=max_paths,
+        change_of_variables_moves=change_of_variables_moves,
+        ac45_moves=ac45_moves,
+        n_gen=n_gen,
+        max_n_gen=max_n_gen,
     )
     if failures:
         raise SystemExit(f"{len(failures)} path(s) FAILED validation: {failures}")

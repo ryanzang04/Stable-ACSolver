@@ -22,6 +22,7 @@ from flax.training.train_state import TrainState
 from envs.ac_s import ACS
 from wrappers import LogWrapper, NormalizeVecReward, LogPathsProbsS
 from network import RelativeDualRingActorCritic
+from envs.utils import decode_action_jax, encode_action_jax
 
 jax.config.update("jax_default_matmul_precision", "float32")
 
@@ -37,6 +38,12 @@ class Transition(NamedTuple):
 
 
 def make_train(config):
+    if config.get("N_GEN", 2) != 2 or config.get("MAX_N_GEN", 2) != 2:
+        raise ValueError(
+            "ppo_ac_s.py uses the two-ring transformer and currently requires "
+            "N_GEN=2 and MAX_N_GEN=2. Use envs.ac_s.ACS directly for generic "
+            "n-generator stable AC moves."
+        )
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -44,17 +51,24 @@ def make_train(config):
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
     L = 24
-    env = ACS(n_gen=2, max_length=L, max_steps_in_episode=int(config["NUM_STEPS"]),
+    env = ACS(n_gen=config.get("N_GEN", 2), max_n_gen=config.get("MAX_N_GEN", 2),
+              max_length=L, max_steps_in_episode=int(config["NUM_STEPS"]),
               is_reward_sparse=False,
               initial_states_file='AC19_extended',
               cycle_penalty=config.get("CYCLE_PENALTY", 0.0),
-              noop_penalty=config.get("NOOP_PENALTY", 0.0))
+              noop_penalty=config.get("NOOP_PENALTY", 0.0),
+              change_of_variables_moves=config.get("CHANGE_OF_VARIABLES_MOVES", False),
+              ac45_moves=config.get("AC45_MOVES", False))
     env_params = env.default_params
     env = LogWrapper(env)
     env = NormalizeVecReward(env, config["GAMMA"])
     env = LogPathsProbsS(env, config["NUM_ENVS"])
 
-    network = RelativeDualRingActorCritic(activation=config["ACTIVATION"])
+    network = RelativeDualRingActorCritic(
+        activation=config["ACTIVATION"],
+        change_of_variables_moves=config.get("CHANGE_OF_VARIABLES_MOVES", False),
+        ac45_moves=config.get("AC45_MOVES", False),
+    )
 
     def linear_schedule(count):
         frac = (
@@ -109,18 +123,12 @@ def make_train(config):
                 rng, _rng = jax.random.split(rng)
                 pi, value = network.apply(train_state.params, last_obs)
                 sample = pi.sample(seed=_rng)
-
-                action_k1 = (sample // (4 * L)) + 1
-                rem = sample % (4 * L)
-
-                action_k2_tmp = rem // 4
-                ij = rem % 4
-
-                action_i = ij // 2
-                action_j = ij % 2
-                action_k2 = action_k2_tmp * (-1)**action_j - action_j
-
-                action = jnp.stack([action_i, action_j, action_k1, action_k2], axis=-1)
+                action = decode_action_jax(
+                    sample, L,
+                    config.get("CHANGE_OF_VARIABLES_MOVES", False),
+                    config.get("AC45_MOVES", False),
+                    max_n_gen=config.get("MAX_N_GEN", 2),
+                )
                 log_prob = pi.log_prob(sample)
 
                 rng, _rng = jax.random.split(rng)
@@ -169,11 +177,13 @@ def make_train(config):
 
                     def _loss_fn(params, traj_batch, gae, targets):
                         pi, value = network.apply(params, traj_batch.obs)
-                        action_i = traj_batch.action[:, 0]
-                        action_j = traj_batch.action[:, 1]
-                        action_k1 = traj_batch.action[:, 2]
-                        action_k2 = traj_batch.action[:, 3]
-                        sample = (((action_k1 - 1) * L + (action_k2 + action_j) * (-1)**(action_j)) * 4) + (action_i * 2 + action_j)
+                        sample = encode_action_jax(
+                            traj_batch.action,
+                            L,
+                            config.get("CHANGE_OF_VARIABLES_MOVES", False),
+                            config.get("AC45_MOVES", False),
+                            max_n_gen=config.get("MAX_N_GEN", 2),
+                        )
                         log_prob = pi.log_prob(sample)
 
                         value_pred_clipped = traj_batch.value + (
@@ -328,11 +338,25 @@ if __name__ == "__main__":
         parser.add_argument("--noop_penalty", type=float, default=0.0,
                             help="per-step reward penalty when the move did not "
                                  "change the state (length-overflow suppression)")
+        parser.add_argument("--change_of_variables_moves", action="store_true",
+                            help="enable stable change-of-variables moves")
+        parser.add_argument("--ac45_moves", action="store_true",
+                            help="enable AC4 add-generator and AC5 delete-generator moves")
+        parser.add_argument("--stable_ac_moves", action="store_true",
+                            help="deprecated alias for enabling both "
+                                 "--change_of_variables_moves and --ac45_moves")
+        parser.add_argument("--max_n_gen", type=int, default=2,
+                            help="maximum generator capacity; PPO currently "
+                                 "supports only 2 because the policy is a "
+                                 "two-ring transformer")
         parser.add_argument("--seed", type=int, default=14,
                             help="PRNG seed for init + training rngs")
         return parser.parse_args()
 
     args = parse_args()
+
+    change_of_variables_moves = args.change_of_variables_moves or args.stable_ac_moves
+    ac45_moves = args.ac45_moves or args.stable_ac_moves
 
     config = {
         "LR": 5 * 5e-4,
@@ -357,6 +381,11 @@ if __name__ == "__main__":
         "SEED": args.seed,
         "CYCLE_PENALTY": args.cycle_penalty,
         "NOOP_PENALTY": args.noop_penalty,
+        "CHANGE_OF_VARIABLES_MOVES": change_of_variables_moves,
+        "AC45_MOVES": ac45_moves,
+        "STABLE_AC_MOVES": args.stable_ac_moves,
+        "N_GEN": 2,
+        "MAX_N_GEN": args.max_n_gen,
     }
 
     if config.get("WANDB_MODE", "disabled") == "online":
