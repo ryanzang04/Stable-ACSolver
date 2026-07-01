@@ -323,6 +323,10 @@ if __name__ == "__main__":
         parser.add_argument("--ckpt_path", type=str, default="",
                             help="checkpoint folder name under ppo_checkpoints/ "
                                  "(empty = no checkpoints)")
+        parser.add_argument("--params_only_checkpoint", action="store_true",
+                            help="save only params/config. This avoids large "
+                                 "solve_data checkpoint transfers on low-memory "
+                                 "or native Windows runs.")
         parser.add_argument("--save_every", type=int, default=50,
                             help="save an Orbax checkpoint every N PPO updates")
         parser.add_argument("--resume_from", type=str, default="",
@@ -435,6 +439,11 @@ if __name__ == "__main__":
     if args.ckpt_path:
         ckpt_path_abs = os.path.join(os.getcwd(), "ppo_checkpoints", args.ckpt_path)
         print(f"Saving checkpoints to {ckpt_path_abs} every {args.save_every} updates")
+        ckpt_item_names = (
+            ("params", "config")
+            if args.params_only_checkpoint
+            else ("params", "solve_data", "config")
+        )
         options = ocp.CheckpointManagerOptions(
             max_to_keep=3,
             save_interval_steps=args.save_every,
@@ -442,25 +451,34 @@ if __name__ == "__main__":
         ckpt_manager = ocp.CheckpointManager(
             ckpt_path_abs,
             options=options,
-            item_names=("params", "solve_data", "config"),
+            item_names=ckpt_item_names,
         )
         latest = ckpt_manager.latest_step()
         if latest is not None:
             print(f"Resuming params from checkpoint step {latest}")
             dummy_params = runner_state[0].params
-            dummy_solve_data = {
-                "solved_idx": runner_state[1].solved_idx,
-                "path_lengths": runner_state[1].path_lengths,
-                "best_paths": runner_state[1].best_paths,
-            }
-            restored = ckpt_manager.restore(
-                latest,
-                args=ocp.args.Composite(
-                    params=ocp.args.StandardRestore(dummy_params),
-                    solve_data=ocp.args.StandardRestore(dummy_solve_data),
-                    config=ocp.args.JsonRestore(config),
-                ),
-            )
+            if args.params_only_checkpoint:
+                restored = ckpt_manager.restore(
+                    latest,
+                    args=ocp.args.Composite(
+                        params=ocp.args.StandardRestore(dummy_params),
+                        config=ocp.args.JsonRestore(config),
+                    ),
+                )
+            else:
+                dummy_solve_data = {
+                    "solved_idx": runner_state[1].solved_idx,
+                    "path_lengths": runner_state[1].path_lengths,
+                    "best_paths": runner_state[1].best_paths,
+                }
+                restored = ckpt_manager.restore(
+                    latest,
+                    args=ocp.args.Composite(
+                        params=ocp.args.StandardRestore(dummy_params),
+                        solve_data=ocp.args.StandardRestore(dummy_solve_data),
+                        config=ocp.args.JsonRestore(config),
+                    ),
+                )
             train_state = runner_state[0].replace(params=restored.params)
             runner_state = (train_state, runner_state[1], runner_state[2], runner_state[3])
             latest_step = latest + 1
@@ -475,21 +493,30 @@ if __name__ == "__main__":
         if ckpt_manager is not None:
             params = runner_state[0].params
             env_state = runner_state[1]
-            solve_data = {
-                "solved_idx": env_state.solved_idx,
-                "path_lengths": env_state.path_lengths,
-                "best_paths": env_state.best_paths,
-            }
             # CheckpointManagerOptions(save_interval_steps=save_every) makes
             # save() a no-op except on cadence boundaries.
-            ckpt_manager.save(
-                u,
-                args=ocp.args.Composite(
-                    params=ocp.args.StandardSave(params),
-                    solve_data=ocp.args.StandardSave(solve_data),
-                    config=ocp.args.JsonSave(config),
-                ),
-            )
+            if args.params_only_checkpoint:
+                ckpt_manager.save(
+                    u,
+                    args=ocp.args.Composite(
+                        params=ocp.args.StandardSave(params),
+                        config=ocp.args.JsonSave(config),
+                    ),
+                )
+            else:
+                solve_data = {
+                    "solved_idx": env_state.solved_idx,
+                    "path_lengths": env_state.path_lengths,
+                    "best_paths": env_state.best_paths,
+                }
+                ckpt_manager.save(
+                    u,
+                    args=ocp.args.Composite(
+                        params=ocp.args.StandardSave(params),
+                        solve_data=ocp.args.StandardSave(solve_data),
+                        config=ocp.args.JsonSave(config),
+                    ),
+                )
 
         if config["DEBUG"]:
             env_state = runner_state[1]

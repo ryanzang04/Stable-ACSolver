@@ -37,6 +37,9 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt_path", type=str, required=True,
                    help="folder under ppo_checkpoints/ to restore from")
+    p.add_argument("--params_only_checkpoint", action="store_true",
+                   help="load checkpoints saved with ppo_ac_s.py "
+                        "--params_only_checkpoint")
     p.add_argument("--ckpt_step", type=int, default=-1,
                    help="-1 = latest step in the manager")
     p.add_argument("--dataset", type=str, default="AC19_extended",
@@ -116,9 +119,14 @@ def main():
         train_num_states = sum(1 for _ in f)
 
     ckpt_path_abs = os.path.join(os.getcwd(), "ppo_checkpoints", args.ckpt_path)
+    ckpt_item_names = (
+        ("params", "config")
+        if args.params_only_checkpoint
+        else ("params", "solve_data", "config")
+    )
     mngr = ocp.CheckpointManager(
         ckpt_path_abs,
-        item_names=("params", "solve_data", "config"),
+        item_names=ckpt_item_names,
     )
     step_to_load = mngr.latest_step() if args.ckpt_step < 0 else args.ckpt_step
     if step_to_load is None:
@@ -153,17 +161,29 @@ def main():
         "best_paths": jnp.zeros((train_num_states, train_num_steps), dtype=jnp.int32),
     }
 
-    # Stage 2: load params + solve_data with the right shapes.
-    restored = mngr.restore(
-        step_to_load,
-        args=ocp.args.Composite(
-            params=ocp.args.StandardRestore(dummy_params),
-            solve_data=ocp.args.StandardRestore(dummy_solve_data),
-        ),
-    )
+    # Stage 2: load params, and solve_data when the checkpoint contains it.
+    if args.params_only_checkpoint:
+        restored = mngr.restore(
+            step_to_load,
+            args=ocp.args.Composite(
+                params=ocp.args.StandardRestore(dummy_params),
+            ),
+        )
+    else:
+        restored = mngr.restore(
+            step_to_load,
+            args=ocp.args.Composite(
+                params=ocp.args.StandardRestore(dummy_params),
+                solve_data=ocp.args.StandardRestore(dummy_solve_data),
+            ),
+        )
     params = restored.params
-    train_solved = np.asarray(restored.solve_data["solved_idx"])
-    train_path_lengths = np.asarray(restored.solve_data["path_lengths"])
+    if args.params_only_checkpoint:
+        train_solved = np.zeros((train_num_states,), dtype=bool)
+        train_path_lengths = np.full((train_num_states,), -1, dtype=np.int32)
+    else:
+        train_solved = np.asarray(restored.solve_data["solved_idx"])
+        train_path_lengths = np.asarray(restored.solve_data["path_lengths"])
 
     # If --dataset is a filtered subset produced by make_unsolved_dataset.py,
     # a sidecar `_orig_indices.txt` maps new beam indices -> original training
