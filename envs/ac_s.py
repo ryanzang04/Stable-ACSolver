@@ -177,7 +177,11 @@ class ACS(environment.Environment):
 
     def _is_trivial_presentation(self, x, active_n_gen, params):
         """True iff active relators are singleton generators, in any order."""
-        max_length = params.max_length
+        # JAX requires loop bounds and dynamic_slice sizes to be compile-time
+        # constants. `params` is a traced argument inside env.step(...), so use
+        # the static environment configuration stored on `self`.
+        max_length = self.params.max_length
+        max_n_gen = self.params.max_n_gen
 
         def gen_body(g_idx, all_found):
             code = g_idx + 1
@@ -190,12 +194,12 @@ class ACS(environment.Environment):
                 return found | is_match
 
             found = lax.fori_loop(
-                0, params.max_n_gen, rel_body, jnp.array(False)
+                0, max_n_gen, rel_body, jnp.array(False)
             )
             return all_found & ((g_idx >= active_n_gen) | found)
 
         return lax.fori_loop(
-            0, params.max_n_gen, gen_body, jnp.array(True)
+            0, max_n_gen, gen_body, jnp.array(True)
         )
 
     def reset_env(
