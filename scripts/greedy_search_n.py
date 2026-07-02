@@ -14,6 +14,14 @@ Examples, run from the repository root:
 
     python scripts/greedy_search_n.py --relators XyyyxYYYY XYXyxy --max_nodes 10000
     python scripts/greedy_search_n.py --dataset 1190MS --idx 0 --max_nodes 10000
+    python scripts/greedy_search_n.py --dataset 1190MS --all --max_nodes 10000 \
+        --out_jsonl greedy_1190MS.jsonl
+    python scripts/greedy_search_n.py --dataset 1190MS --all --max_nodes 10000 \
+        --wandb --wandb_project ACSolverX-greedy
+    python scripts/greedy_search_n.py --dataset 1190MS --compare_cov --all \
+        --max_nodes 10000 --out_jsonl cov_compare.jsonl
+    python scripts/greedy_search_n.py --dataset AC19 --start 0 --end 100 \
+        --max_nodes 5000
     python scripts/greedy_search_n.py --relators xyxYXY xxxYYYY \
         --change_of_variables_moves --max_n_gen 2 --show_path
 """
@@ -28,6 +36,7 @@ import json
 import os
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from functools import partial
 from typing import Iterator, Sequence
@@ -111,6 +120,14 @@ class MoveParams:
     max_n_gen: int = 2
     max_length: int = 24
     max_steps_in_episode: int = 200
+
+
+@dataclass(frozen=True)
+class DatasetRow:
+    idx: int
+    flat: np.ndarray
+    n_gen: int
+    max_n_gen: int
 
 
 def parse_word(text: str) -> list[int]:
@@ -443,6 +460,7 @@ class GreedyNSolver:
         ac45_moves: bool,
         chunk_size: int,
         verbose: bool,
+        apply_batch=None,
     ):
         self.max_n_gen = max_n_gen
         self.max_length = max_length
@@ -463,7 +481,7 @@ class GreedyNSolver:
             max_length=max_length,
             max_steps_in_episode=max_depth or max_nodes,
         )
-        self.apply_batch = build_apply_batch(
+        self.apply_batch = apply_batch or build_apply_batch(
             self.params, change_of_variables_moves, ac45_moves
         )
 
@@ -573,32 +591,27 @@ class GreedyNSolver:
         return keys, actions
 
 
-def load_dataset_presentation(
-    dataset: str,
-    idx: int,
+def dataset_path(dataset: str) -> str:
+    path_txt = os.path.join(REPO_ROOT, "data", f"{dataset}.txt")
+    path_gz = f"{path_txt}.gz"
+    if os.path.exists(path_txt):
+        return path_txt
+    if os.path.exists(path_gz):
+        return path_gz
+    raise FileNotFoundError(f"could not find data/{dataset}.txt or .txt.gz")
+
+
+def open_dataset(path: str):
+    return gzip.open(path, "rt") if path.endswith(".gz") else open(path, "rt")
+
+
+def normalize_dataset_flat(
+    flat: Sequence[int],
     n_gen: int | None,
     max_n_gen: int | None,
     max_length: int,
 ) -> tuple[np.ndarray, int, int]:
-    path_txt = os.path.join(REPO_ROOT, "data", f"{dataset}.txt")
-    path_gz = f"{path_txt}.gz"
-    if os.path.exists(path_txt):
-        opener = open
-        path = path_txt
-    elif os.path.exists(path_gz):
-        opener = gzip.open
-        path = path_gz
-    else:
-        raise FileNotFoundError(f"could not find data/{dataset}.txt or .txt.gz")
-
-    with opener(path, "rt") as handle:
-        for line_idx, line in enumerate(handle):
-            if line_idx == idx:
-                flat = np.asarray(ast.literal_eval(line.strip()), dtype=np.int8)
-                break
-        else:
-            raise IndexError(f"dataset {dataset!r} has no row {idx}")
-
+    flat = np.asarray(flat, dtype=np.int8)
     if n_gen is None:
         if len(flat) % max_length != 0:
             raise ValueError(
@@ -614,6 +627,48 @@ def load_dataset_presentation(
     if max_n_gen != n_gen:
         flat = change_presentation_shape(flat, n_gen, max_length, max_n_gen=max_n_gen)
     return np.asarray(flat, dtype=np.int8), n_gen, max_n_gen
+
+
+def load_dataset_presentation(
+    dataset: str,
+    idx: int,
+    n_gen: int | None,
+    max_n_gen: int | None,
+    max_length: int,
+) -> tuple[np.ndarray, int, int]:
+    path = dataset_path(dataset)
+    with open_dataset(path) as handle:
+        for line_idx, line in enumerate(handle):
+            if line_idx == idx:
+                flat = ast.literal_eval(line.strip())
+                return normalize_dataset_flat(flat, n_gen, max_n_gen, max_length)
+    raise IndexError(f"dataset {dataset!r} has no row {idx}")
+
+
+def iter_dataset_rows(
+    dataset: str,
+    start: int,
+    end: int | None,
+    n_gen: int | None,
+    max_n_gen: int | None,
+    max_length: int,
+) -> Iterator[DatasetRow]:
+    path = dataset_path(dataset)
+    with open_dataset(path) as handle:
+        for line_idx, line in enumerate(handle):
+            if line_idx < start:
+                continue
+            if end is not None and line_idx >= end:
+                break
+            flat, row_n_gen, row_max_n_gen = normalize_dataset_flat(
+                ast.literal_eval(line.strip()), n_gen, max_n_gen, max_length
+            )
+            yield DatasetRow(
+                idx=line_idx,
+                flat=flat,
+                n_gen=row_n_gen,
+                max_n_gen=row_max_n_gen,
+            )
 
 
 def build_initial_from_relators(
@@ -678,6 +733,97 @@ def format_action(
     return f"unknown_action{action}"
 
 
+def result_payload(result: SearchResult, idx: int | None = None) -> dict:
+    payload = {
+        "solved": result.solved,
+        "nodes_visited": result.nodes_visited,
+        "seen_count": result.seen_count,
+        "elapsed_sec": result.elapsed_sec,
+        "path_length": len(result.path_actions) if result.solved else -1,
+        "path": [
+            [[int(v) for v in word] for word in key[1]]
+            for key in result.path_keys
+        ],
+        "actions": [list(map(int, action)) for action in result.path_actions],
+    }
+    if idx is not None:
+        payload["idx"] = idx
+    return payload
+
+
+def init_wandb_run(
+    args: argparse.Namespace,
+    change_of_variables_moves: bool,
+    ac45_moves: bool,
+    batch_mode: bool,
+):
+    if not args.wandb:
+        return None
+    try:
+        import wandb
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            "wandb is not installed. Install it or run without --wandb."
+        ) from exc
+
+    config = {
+        "dataset": args.dataset,
+        "idx": args.idx,
+        "all": args.all,
+        "start": args.start,
+        "end": args.end,
+        "n_gen": args.n_gen,
+        "max_n_gen": args.max_n_gen,
+        "max_length": args.max_length,
+        "max_total_length": args.max_total_length,
+        "max_nodes": args.max_nodes,
+        "max_depth": args.max_depth,
+        "chunk_size": args.chunk_size,
+        "change_of_variables_moves": change_of_variables_moves,
+        "ac45_moves": ac45_moves,
+        "stable_ac_moves": args.stable_ac_moves,
+        "compare_cov": args.compare_cov,
+        "batch_mode": batch_mode,
+        "wandb_window": args.wandb_window,
+        "wandb_log_every": args.wandb_log_every,
+        "index_summary_limit": args.index_summary_limit,
+        "wandb_table": args.wandb_table,
+    }
+    name = args.wandb_run_name or None
+    tags = args.wandb_tags if args.wandb_tags else None
+    return wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity or None,
+        name=name,
+        tags=tags,
+        config=config,
+        mode=args.wandb_mode,
+    )
+
+
+def log_single_wandb(wandb_run, result: SearchResult, idx: int | None = None) -> None:
+    if wandb_run is None:
+        return
+    solved = int(result.solved)
+    wandb_run.log(
+        {
+            "idx": -1 if idx is None else idx,
+            "solved": solved,
+            "path_length": len(result.path_actions) if result.solved else -1,
+            "nodes_visited": result.nodes_visited,
+            "seen_count": result.seen_count,
+            "elapsed_sec": result.elapsed_sec,
+            "solve_rate": float(solved),
+            "num_solved": solved,
+            "processed": 1,
+        },
+        step=1,
+    )
+    wandb_run.summary["solve_rate"] = float(solved)
+    wandb_run.summary["num_solved"] = solved
+    wandb_run.summary["processed"] = 1
+
+
 def emit_result(
     result: SearchResult,
     max_n_gen: int,
@@ -728,20 +874,520 @@ def emit_result(
         print("packed_path =", packed)
 
     if out_json is not None:
-        payload = {
-            "solved": result.solved,
-            "nodes_visited": result.nodes_visited,
-            "seen_count": result.seen_count,
-            "elapsed_sec": result.elapsed_sec,
-            "path": [
-                [[int(v) for v in word] for word in key[1]]
-                for key in result.path_keys
-            ],
-            "actions": [list(map(int, action)) for action in result.path_actions],
-        }
         with open(out_json, "w") as handle:
-            json.dump(payload, handle, indent=2)
+            json.dump(result_payload(result), handle, indent=2)
             handle.write("\n")
+
+
+def make_solver(
+    initial_flat: np.ndarray,
+    n_gen: int,
+    max_n_gen: int,
+    args: argparse.Namespace,
+    change_of_variables_moves: bool,
+    ac45_moves: bool,
+    verbose: bool,
+    apply_batch=None,
+) -> GreedyNSolver:
+    return GreedyNSolver(
+        initial_flat=initial_flat,
+        n_gen=n_gen,
+        max_n_gen=max_n_gen,
+        max_length=args.max_length,
+        max_nodes=args.max_nodes,
+        max_total_length=args.max_total_length,
+        max_depth=args.max_depth,
+        change_of_variables_moves=change_of_variables_moves,
+        ac45_moves=ac45_moves,
+        chunk_size=args.chunk_size,
+        verbose=verbose,
+        apply_batch=apply_batch,
+    )
+
+
+def solve_dataset_row(
+    row: DatasetRow,
+    args: argparse.Namespace,
+    change_of_variables_moves: bool,
+    ac45_moves: bool,
+    apply_batch_cache: dict,
+    verbose: bool = False,
+) -> SearchResult:
+    cache_key = (
+        row.max_n_gen,
+        args.max_length,
+        bool(change_of_variables_moves),
+        bool(ac45_moves),
+    )
+    if cache_key not in apply_batch_cache:
+        params = MoveParams(
+            n_gen=row.n_gen,
+            max_n_gen=row.max_n_gen,
+            max_length=args.max_length,
+            max_steps_in_episode=args.max_depth or args.max_nodes,
+        )
+        apply_batch_cache[cache_key] = build_apply_batch(
+            params, change_of_variables_moves, ac45_moves
+        )
+
+    solver = make_solver(
+        row.flat,
+        row.n_gen,
+        row.max_n_gen,
+        args,
+        change_of_variables_moves,
+        ac45_moves,
+        verbose=verbose,
+        apply_batch=apply_batch_cache[cache_key],
+    )
+    return solver.solve()
+
+
+def capped_indices(indices: Sequence[int], limit: int) -> list[int]:
+    if limit <= 0:
+        return []
+    return [int(idx) for idx in indices[:limit]]
+
+
+def add_index_summaries(wandb_run, prefix: str, indices: Sequence[int],
+                        limit: int) -> None:
+    if wandb_run is None:
+        return
+    key_prefix = f"{prefix}_" if prefix else ""
+    wandb_run.summary[f"{key_prefix}indices_count"] = len(indices)
+    wandb_run.summary[f"{key_prefix}indices"] = capped_indices(indices, limit)
+    wandb_run.summary[f"{key_prefix}indices_truncated"] = len(indices) > limit
+
+
+def maybe_log_wandb_table(wandb_run, key: str, columns: list[str],
+                          rows: list[list], enabled: bool) -> None:
+    if wandb_run is None or not enabled:
+        return
+    import wandb
+    wandb_run.log({key: wandb.Table(columns=columns, data=rows)})
+
+
+def run_dataset_batch(
+    args: argparse.Namespace,
+    change_of_variables_moves: bool,
+    ac45_moves: bool,
+) -> None:
+    start = args.start if args.start is not None else 0
+    end = args.end
+    if start < 0:
+        raise SystemExit("--start must be non-negative")
+    if end is not None and end <= start:
+        raise SystemExit("--end must be greater than --start")
+    if args.show_path:
+        raise SystemExit("--show_path is only supported for a single presentation")
+    if args.print_packed:
+        raise SystemExit("--print_packed is only supported for a single presentation")
+
+    out_jsonl = args.out_jsonl or args.out_json
+    out_handle = open(out_jsonl, "w") if out_jsonl is not None else None
+    wandb_run = init_wandb_run(
+        args, change_of_variables_moves, ac45_moves, batch_mode=True
+    )
+    solved_window = deque(maxlen=args.wandb_window)
+    apply_batch_cache = {}
+    total = 0
+    solved = 0
+    total_nodes = 0
+    solved_indices: list[int] = []
+    table_rows: list[list] = []
+    t0 = time.time()
+
+    try:
+        for row in iter_dataset_rows(
+            args.dataset,
+            start,
+            end,
+            args.n_gen,
+            args.max_n_gen,
+            args.max_length,
+        ):
+            result = solve_dataset_row(
+                row,
+                args,
+                change_of_variables_moves,
+                ac45_moves,
+                apply_batch_cache,
+            )
+            total += 1
+            row_solved = int(result.solved)
+            solved += row_solved
+            if result.solved:
+                solved_indices.append(row.idx)
+            solved_window.append(row_solved)
+            total_nodes += result.nodes_visited
+            solve_rate = solved / total
+            rolling_solve_rate = sum(solved_window) / len(solved_window)
+            depth = len(result.path_actions) if result.solved else -1
+            solved_idx = row.idx if result.solved else -1
+            table_rows.append(
+                [
+                    row.idx,
+                    bool(result.solved),
+                    depth,
+                    result.nodes_visited,
+                    result.seen_count,
+                    result.elapsed_sec,
+                    solve_rate,
+                ]
+            )
+
+            if not args.quiet:
+                status = "SOLVED" if result.solved else "not solved"
+                print(
+                    f"[{row.idx}] {status} depth={depth} "
+                    f"nodes={result.nodes_visited} seen={result.seen_count} "
+                    f"time={result.elapsed_sec:.3f}s solve_rate={solve_rate:.3f}",
+                    flush=True,
+                )
+
+            if out_handle is not None:
+                payload = result_payload(result, idx=row.idx)
+                payload.update(
+                    {
+                        "processed": total,
+                        "num_solved": solved,
+                        "solved_idx": solved_idx,
+                        "solve_rate": solve_rate,
+                        "rolling_solve_rate": rolling_solve_rate,
+                        "total_nodes": total_nodes,
+                    }
+                )
+                json.dump(payload, out_handle)
+                out_handle.write("\n")
+                out_handle.flush()
+
+            if wandb_run is not None and total % args.wandb_log_every == 0:
+                elapsed_so_far = time.time() - t0
+                wandb_run.log(
+                    {
+                        "idx": row.idx,
+                        "processed": total,
+                        "solved": row_solved,
+                        "solved_idx": solved_idx,
+                        "num_solved": solved,
+                        "solve_rate": solve_rate,
+                        "rolling_solve_rate": rolling_solve_rate,
+                        "path_length": depth,
+                        "nodes_visited": result.nodes_visited,
+                        "seen_count": result.seen_count,
+                        "elapsed_sec": result.elapsed_sec,
+                        "total_nodes": total_nodes,
+                        "rows_per_second": total / max(elapsed_so_far, 1e-9),
+                        "active_n_gen": row.n_gen,
+                        "max_n_gen": row.max_n_gen,
+                    },
+                    step=total,
+                )
+    finally:
+        if out_handle is not None:
+            out_handle.close()
+
+    elapsed = time.time() - t0
+    final_solve_rate = solved / total if total else 0.0
+    if wandb_run is not None:
+        wandb_run.summary["processed"] = total
+        wandb_run.summary["num_solved"] = solved
+        wandb_run.summary["num_unsolved"] = total - solved
+        wandb_run.summary["solve_rate"] = final_solve_rate
+        wandb_run.summary["total_nodes"] = total_nodes
+        wandb_run.summary["elapsed_sec"] = elapsed
+        add_index_summaries(
+            wandb_run, "solved", solved_indices, args.index_summary_limit
+        )
+        maybe_log_wandb_table(
+            wandb_run,
+            "results",
+            [
+                "idx",
+                "solved",
+                "path_length",
+                "nodes_visited",
+                "seen_count",
+                "elapsed_sec",
+                "solve_rate",
+            ],
+            table_rows,
+            args.wandb_table,
+        )
+        wandb_run.finish()
+    print(
+        f"SUMMARY rows={total} solved={solved} unsolved={total - solved} "
+        f"solve_rate={final_solve_rate:.3f} nodes={total_nodes} time={elapsed:.3f}s"
+    )
+
+
+def comparison_result_payload(
+    row: DatasetRow,
+    without_cov: SearchResult,
+    with_cov: SearchResult,
+    processed: int,
+    counts: dict[str, int],
+) -> dict:
+    without_depth = len(without_cov.path_actions) if without_cov.solved else -1
+    with_depth = len(with_cov.path_actions) if with_cov.solved else -1
+    total = max(processed, 1)
+    return {
+        "idx": row.idx,
+        "processed": processed,
+        "without_cov_solved": bool(without_cov.solved),
+        "with_cov_solved": bool(with_cov.solved),
+        "cov_only_solved": bool(with_cov.solved and not without_cov.solved),
+        "without_cov_only_solved": bool(without_cov.solved and not with_cov.solved),
+        "both_solved": bool(without_cov.solved and with_cov.solved),
+        "neither_solved": bool(not without_cov.solved and not with_cov.solved),
+        "without_cov_path_length": without_depth,
+        "with_cov_path_length": with_depth,
+        "path_length_delta_cov_minus_without": (
+            with_depth - without_depth
+            if without_cov.solved and with_cov.solved else None
+        ),
+        "without_cov_nodes": without_cov.nodes_visited,
+        "with_cov_nodes": with_cov.nodes_visited,
+        "without_cov_seen": without_cov.seen_count,
+        "with_cov_seen": with_cov.seen_count,
+        "without_cov_elapsed_sec": without_cov.elapsed_sec,
+        "with_cov_elapsed_sec": with_cov.elapsed_sec,
+        "without_cov_solve_rate": counts["without_cov_solved"] / total,
+        "with_cov_solve_rate": counts["with_cov_solved"] / total,
+        "cov_only_count": counts["cov_only"],
+        "without_cov_only_count": counts["without_cov_only"],
+        "both_solved_count": counts["both"],
+        "neither_solved_count": counts["neither"],
+    }
+
+
+def run_cov_comparison(args: argparse.Namespace, ac45_moves: bool) -> None:
+    start = args.start
+    if start is None:
+        start = 0 if args.all or args.end is not None else args.idx
+    end = args.end
+    if end is None and not args.all:
+        end = start + 1
+    if start < 0:
+        raise SystemExit("--start/--idx must be non-negative")
+    if end is not None and end <= start:
+        raise SystemExit("--end must be greater than the first index")
+    if args.show_path:
+        raise SystemExit("--show_path is not supported in --compare_cov mode")
+    if args.print_packed:
+        raise SystemExit("--print_packed is not supported in --compare_cov mode")
+
+    out_jsonl = args.out_jsonl or args.out_json
+    out_handle = open(out_jsonl, "w") if out_jsonl is not None else None
+    wandb_run = init_wandb_run(
+        args, change_of_variables_moves=True, ac45_moves=ac45_moves,
+        batch_mode=True,
+    )
+    apply_batch_cache = {}
+    counts = {
+        "without_cov_solved": 0,
+        "with_cov_solved": 0,
+        "cov_only": 0,
+        "without_cov_only": 0,
+        "both": 0,
+        "neither": 0,
+    }
+    without_cov_solved_indices: list[int] = []
+    with_cov_solved_indices: list[int] = []
+    cov_only_indices: list[int] = []
+    without_cov_only_indices: list[int] = []
+    both_solved_indices: list[int] = []
+    table_rows: list[list] = []
+    total_nodes = 0
+    total = 0
+    t0 = time.time()
+
+    try:
+        for row in iter_dataset_rows(
+            args.dataset,
+            start,
+            end,
+            args.n_gen,
+            args.max_n_gen,
+            args.max_length,
+        ):
+            without_cov = solve_dataset_row(
+                row, args, False, ac45_moves, apply_batch_cache
+            )
+            with_cov = solve_dataset_row(
+                row, args, True, ac45_moves, apply_batch_cache
+            )
+            total += 1
+            no_solved = int(without_cov.solved)
+            cov_solved = int(with_cov.solved)
+            cov_only = bool(with_cov.solved and not without_cov.solved)
+            without_only = bool(without_cov.solved and not with_cov.solved)
+            both = bool(without_cov.solved and with_cov.solved)
+            neither = bool(not without_cov.solved and not with_cov.solved)
+            counts["without_cov_solved"] += no_solved
+            counts["with_cov_solved"] += cov_solved
+            counts["cov_only"] += int(cov_only)
+            counts["without_cov_only"] += int(without_only)
+            counts["both"] += int(both)
+            counts["neither"] += int(neither)
+            total_nodes += without_cov.nodes_visited + with_cov.nodes_visited
+
+            if without_cov.solved:
+                without_cov_solved_indices.append(row.idx)
+            if with_cov.solved:
+                with_cov_solved_indices.append(row.idx)
+            if cov_only:
+                cov_only_indices.append(row.idx)
+            if without_only:
+                without_cov_only_indices.append(row.idx)
+            if both:
+                both_solved_indices.append(row.idx)
+
+            payload = comparison_result_payload(
+                row, without_cov, with_cov, total, counts
+            )
+            without_depth = payload["without_cov_path_length"]
+            with_depth = payload["with_cov_path_length"]
+            relation = (
+                "cov_only" if cov_only else
+                "without_cov_only" if without_only else
+                "both" if both else
+                "neither"
+            )
+            table_rows.append(
+                [
+                    row.idx,
+                    bool(without_cov.solved),
+                    bool(with_cov.solved),
+                    relation,
+                    without_depth,
+                    with_depth,
+                    without_cov.nodes_visited,
+                    with_cov.nodes_visited,
+                    without_cov.elapsed_sec,
+                    with_cov.elapsed_sec,
+                ]
+            )
+
+            if not args.quiet:
+                print(
+                    f"[{row.idx}] no_cov={bool(without_cov.solved)} "
+                    f"cov={bool(with_cov.solved)} relation={relation} "
+                    f"no_depth={without_depth} cov_depth={with_depth} "
+                    f"cov_only={counts['cov_only']} "
+                    f"cov_rate={counts['with_cov_solved'] / total:.3f} "
+                    f"no_cov_rate={counts['without_cov_solved'] / total:.3f}",
+                    flush=True,
+                )
+
+            if out_handle is not None:
+                json.dump(payload, out_handle)
+                out_handle.write("\n")
+                out_handle.flush()
+
+            if wandb_run is not None and total % args.wandb_log_every == 0:
+                elapsed_so_far = time.time() - t0
+                wandb_run.log(
+                    {
+                        "idx": row.idx,
+                        "processed": total,
+                        "without_cov/solved": no_solved,
+                        "with_cov/solved": cov_solved,
+                        "without_cov/solve_rate": counts["without_cov_solved"] / total,
+                        "with_cov/solve_rate": counts["with_cov_solved"] / total,
+                        "cov_only_solved": int(cov_only),
+                        "without_cov_only_solved": int(without_only),
+                        "both_solved": int(both),
+                        "neither_solved": int(neither),
+                        "cov_only_count": counts["cov_only"],
+                        "without_cov_only_count": counts["without_cov_only"],
+                        "cov_only_idx": row.idx if cov_only else -1,
+                        "without_cov_only_idx": row.idx if without_only else -1,
+                        "without_cov/path_length": without_depth,
+                        "with_cov/path_length": with_depth,
+                        "without_cov/nodes_visited": without_cov.nodes_visited,
+                        "with_cov/nodes_visited": with_cov.nodes_visited,
+                        "without_cov/elapsed_sec": without_cov.elapsed_sec,
+                        "with_cov/elapsed_sec": with_cov.elapsed_sec,
+                        "total_nodes": total_nodes,
+                        "rows_per_second": total / max(elapsed_so_far, 1e-9),
+                    },
+                    step=total,
+                )
+    finally:
+        if out_handle is not None:
+            out_handle.close()
+
+    elapsed = time.time() - t0
+    without_rate = counts["without_cov_solved"] / total if total else 0.0
+    with_rate = counts["with_cov_solved"] / total if total else 0.0
+    if wandb_run is not None:
+        wandb_run.summary["processed"] = total
+        wandb_run.summary["without_cov_num_solved"] = counts["without_cov_solved"]
+        wandb_run.summary["with_cov_num_solved"] = counts["with_cov_solved"]
+        wandb_run.summary["without_cov_solve_rate"] = without_rate
+        wandb_run.summary["with_cov_solve_rate"] = with_rate
+        wandb_run.summary["cov_only_count"] = counts["cov_only"]
+        wandb_run.summary["without_cov_only_count"] = counts["without_cov_only"]
+        wandb_run.summary["both_solved_count"] = counts["both"]
+        wandb_run.summary["neither_solved_count"] = counts["neither"]
+        wandb_run.summary["total_nodes"] = total_nodes
+        wandb_run.summary["elapsed_sec"] = elapsed
+        add_index_summaries(
+            wandb_run, "without_cov_solved", without_cov_solved_indices,
+            args.index_summary_limit,
+        )
+        add_index_summaries(
+            wandb_run, "with_cov_solved", with_cov_solved_indices,
+            args.index_summary_limit,
+        )
+        add_index_summaries(
+            wandb_run, "cov_only", cov_only_indices, args.index_summary_limit
+        )
+        add_index_summaries(
+            wandb_run, "without_cov_only", without_cov_only_indices,
+            args.index_summary_limit,
+        )
+        add_index_summaries(
+            wandb_run, "both_solved", both_solved_indices,
+            args.index_summary_limit,
+        )
+        maybe_log_wandb_table(
+            wandb_run,
+            "cov_comparison",
+            [
+                "idx",
+                "without_cov_solved",
+                "with_cov_solved",
+                "relation",
+                "without_cov_path_length",
+                "with_cov_path_length",
+                "without_cov_nodes",
+                "with_cov_nodes",
+                "without_cov_elapsed_sec",
+                "with_cov_elapsed_sec",
+            ],
+            table_rows,
+            args.wandb_table,
+        )
+        wandb_run.finish()
+
+    print(
+        "SUMMARY "
+        f"rows={total} "
+        f"without_cov_solved={counts['without_cov_solved']} "
+        f"with_cov_solved={counts['with_cov_solved']} "
+        f"without_cov_rate={without_rate:.3f} "
+        f"with_cov_rate={with_rate:.3f} "
+        f"cov_only={counts['cov_only']} "
+        f"without_cov_only={counts['without_cov_only']} "
+        f"both={counts['both']} neither={counts['neither']} "
+        f"nodes={total_nodes} time={elapsed:.3f}s"
+    )
+    if cov_only_indices:
+        print("COV_ONLY_INDICES", cov_only_indices)
+    if without_cov_only_indices:
+        print("WITHOUT_COV_ONLY_INDICES", without_cov_only_indices)
 
 
 def parse_args() -> argparse.Namespace:
@@ -759,6 +1405,18 @@ def parse_args() -> argparse.Namespace:
         help="dataset stem under data/; use with --idx",
     )
     parser.add_argument("--idx", type=int, default=0, help="dataset row index")
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="run every row in --dataset, starting at --start if provided",
+    )
+    parser.add_argument("--start", type=int, default=None, help="first dataset index")
+    parser.add_argument(
+        "--end",
+        type=int,
+        default=None,
+        help="exclusive end dataset index; omit with --all to run to EOF",
+    )
     parser.add_argument("--n_gen", type=int, default=None)
     parser.add_argument("--max_n_gen", type=int, default=None)
     parser.add_argument("--max_length", type=int, default=24)
@@ -773,9 +1431,61 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="alias for enabling both --change_of_variables_moves and --ac45_moves",
     )
+    parser.add_argument(
+        "--compare_cov",
+        action="store_true",
+        help="run each dataset row without COV and with COV, then compare",
+    )
     parser.add_argument("--show_path", action="store_true")
     parser.add_argument("--print_packed", action="store_true")
     parser.add_argument("--out_json", default=None)
+    parser.add_argument(
+        "--out_jsonl",
+        default=None,
+        help="batch-mode output path; writes one JSON object per dataset row",
+    )
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="enable Weights & Biases logging",
+    )
+    parser.add_argument("--wandb_project", default="ACSolverX-greedy")
+    parser.add_argument("--wandb_entity", default="")
+    parser.add_argument("--wandb_run_name", default="")
+    parser.add_argument(
+        "--wandb_mode",
+        default="online",
+        choices=["online", "offline", "disabled"],
+    )
+    parser.add_argument(
+        "--wandb_tags",
+        nargs="*",
+        default=[],
+        help="optional tags for the WandB run",
+    )
+    parser.add_argument(
+        "--wandb_log_every",
+        type=int,
+        default=1,
+        help="batch-mode WandB logging interval in processed rows",
+    )
+    parser.add_argument(
+        "--wandb_window",
+        type=int,
+        default=100,
+        help="rolling solve-rate window for WandB batch metrics",
+    )
+    parser.add_argument(
+        "--index_summary_limit",
+        type=int,
+        default=10000,
+        help="max number of solved/comparison indices stored in WandB summaries",
+    )
+    parser.add_argument(
+        "--wandb_table",
+        action="store_true",
+        help="log a per-index results table to WandB at the end of batch runs",
+    )
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
 
@@ -792,6 +1502,33 @@ def main() -> None:
         raise SystemExit("--max_length and --max_total_length must be positive")
     if args.chunk_size <= 0:
         raise SystemExit("--chunk_size must be positive")
+    if args.wandb_log_every <= 0:
+        raise SystemExit("--wandb_log_every must be positive")
+    if args.wandb_window <= 0:
+        raise SystemExit("--wandb_window must be positive")
+    if args.index_summary_limit < 0:
+        raise SystemExit("--index_summary_limit must be non-negative")
+    if args.relators is not None and (args.all or args.start is not None or args.end is not None):
+        raise SystemExit("--all/--start/--end only apply with --dataset")
+    if args.compare_cov and args.relators is not None:
+        raise SystemExit("--compare_cov only applies with --dataset")
+    if args.compare_cov and args.dataset is None:
+        raise SystemExit("--compare_cov requires --dataset")
+    if args.out_jsonl is not None and args.dataset is None:
+        raise SystemExit("--out_jsonl only applies with --dataset batch mode")
+
+    comparison_mode = args.compare_cov
+    batch_mode = args.dataset is not None and (
+        args.all or args.start is not None or args.end is not None
+    )
+    if args.out_jsonl is not None and not (batch_mode or comparison_mode):
+        raise SystemExit("--out_jsonl only applies with --all/--start/--end or --compare_cov")
+    if comparison_mode:
+        run_cov_comparison(args, ac45_moves)
+        return
+    if batch_mode:
+        run_dataset_batch(args, change_of_variables_moves, ac45_moves)
+        return
 
     if args.relators is not None:
         inferred_n = args.n_gen
@@ -810,17 +1547,13 @@ def main() -> None:
     if n_gen > max_n_gen:
         raise SystemExit("--n_gen must be <= --max_n_gen")
 
-    solver = GreedyNSolver(
+    solver = make_solver(
         initial_flat=initial_flat,
         n_gen=n_gen,
         max_n_gen=max_n_gen,
-        max_length=args.max_length,
-        max_nodes=args.max_nodes,
-        max_total_length=args.max_total_length,
-        max_depth=args.max_depth,
+        args=args,
         change_of_variables_moves=change_of_variables_moves,
         ac45_moves=ac45_moves,
-        chunk_size=args.chunk_size,
         verbose=not args.quiet,
     )
     if not args.quiet:
@@ -831,7 +1564,17 @@ def main() -> None:
             + f"COV={change_of_variables_moves}, AC45={ac45_moves}",
             flush=True,
         )
+    wandb_run = init_wandb_run(
+        args, change_of_variables_moves, ac45_moves, batch_mode=False
+    )
     result = solver.solve()
+    log_single_wandb(
+        wandb_run,
+        result,
+        idx=args.idx if args.dataset is not None else None,
+    )
+    if wandb_run is not None:
+        wandb_run.finish()
     emit_result(
         result,
         max_n_gen=max_n_gen,
