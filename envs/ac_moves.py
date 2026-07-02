@@ -202,6 +202,22 @@ def _reduce_to_relator(word: jnp.ndarray, max_length: int):
     return relator.astype(word.dtype), reduced_len > max_length
 
 
+def _free_reduce_to_word(word: jnp.ndarray, max_length: int):
+    """Free-reduce `word` and copy it into a padded generator expression.
+
+    This is used for substitution expressions, not relators. Cyclic reduction
+    is valid for final relators, but not for a word that defines a generator:
+    cyclically reducing the expression would replace it by a conjugate before
+    substitution.
+    """
+    reduced = _free_reduce_word(word)
+    reduced_len = jnp.count_nonzero(reduced)
+    positions = jnp.arange(max_length)
+    out = jnp.take(reduced, positions, mode="clip")
+    out = jnp.where(positions < reduced_len, out, jnp.zeros_like(out))
+    return out.astype(word.dtype), reduced_len > max_length
+
+
 def _slice_relator(x: jnp.ndarray, idx: jnp.ndarray, max_length: int) -> jnp.ndarray:
     """Slice a relator slot by dynamic index."""
     return lax.dynamic_slice(x, (idx * max_length,), (max_length,))
@@ -316,7 +332,7 @@ def _change_of_variables(remove_gen: int, iso_relator: int, params, x: jnp.ndarr
     solved_positive = _concat_fixed(_inverse_word(before), z_rhs_word, _inverse_word(after))
     solved_negative = _concat_fixed(after, z_lhs_word, before)
     solved_expr_long = jnp.where(old_token == old_code, solved_positive, solved_negative)
-    solved_expr, expr_overflow = _reduce_to_relator(solved_expr_long, max_length)
+    solved_expr, expr_overflow = _free_reduce_to_word(solved_expr_long, max_length)
 
     # Build the defining relator for z. Since z reuses old_code's numeric slot,
     # this is the relator z * z_word^{-1}, after substituting out the old code.
