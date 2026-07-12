@@ -783,6 +783,7 @@ def init_wandb_run(
         "ac45_moves": ac45_moves,
         "stable_ac_moves": args.stable_ac_moves,
         "compare_cov": args.compare_cov,
+        "compare_cov_paths": args.compare_cov_paths,
         "batch_mode": batch_mode,
         "wandb_window": args.wandb_window,
         "wandb_log_every": args.wandb_log_every,
@@ -1127,11 +1128,12 @@ def comparison_result_payload(
     with_cov: SearchResult,
     processed: int,
     counts: dict[str, int],
+    include_paths: bool = False,
 ) -> dict:
     without_depth = len(without_cov.path_actions) if without_cov.solved else -1
     with_depth = len(with_cov.path_actions) if with_cov.solved else -1
     total = max(processed, 1)
-    return {
+    payload = {
         "idx": row.idx,
         "processed": processed,
         "without_cov_solved": bool(without_cov.solved),
@@ -1159,6 +1161,10 @@ def comparison_result_payload(
         "both_solved_count": counts["both"],
         "neither_solved_count": counts["neither"],
     }
+    if include_paths:
+        payload["without_cov_result"] = result_payload(without_cov, row.idx)
+        payload["with_cov_result"] = result_payload(with_cov, row.idx)
+    return payload
 
 
 def run_cov_comparison(args: argparse.Namespace, ac45_moves: bool) -> None:
@@ -1244,7 +1250,12 @@ def run_cov_comparison(args: argparse.Namespace, ac45_moves: bool) -> None:
                 both_solved_indices.append(row.idx)
 
             payload = comparison_result_payload(
-                row, without_cov, with_cov, total, counts
+                row,
+                without_cov,
+                with_cov,
+                total,
+                counts,
+                include_paths=args.compare_cov_paths,
             )
             without_depth = payload["without_cov_path_length"]
             with_depth = payload["with_cov_path_length"]
@@ -1435,6 +1446,14 @@ def parse_args() -> argparse.Namespace:
         "--compare_cov",
         action="store_true",
         help="run each dataset row without COV and with COV, then compare",
+    )
+    parser.add_argument(
+        "--compare_cov_paths",
+        action="store_true",
+        help=(
+            "with --compare_cov, include full baseline/COV paths and actions "
+            "in each JSONL row"
+        ),
     )
     parser.add_argument("--show_path", action="store_true")
     parser.add_argument("--print_packed", action="store_true")
