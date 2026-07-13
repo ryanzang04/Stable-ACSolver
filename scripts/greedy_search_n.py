@@ -112,6 +112,39 @@ class SearchResult:
     path_keys: list[StateKey]
     path_actions: list[Action]
     seen_count: int
+    generated_count: int = 0
+    unique_successor_count: int = 0
+    noop_count: int = 0
+    duplicate_count: int = 0
+    limit_pruned_count: int = 0
+    peak_queue_size: int = 0
+    max_active_n_gen: int = 0
+    macro_candidates_generated: int = 0
+    macro_candidates_eligible: int = 0
+    macro_successors_added: int = 0
+    macro_events: list[dict] | None = None
+
+
+@dataclass(frozen=True)
+class MacroCandidate:
+    action: Action
+    next_key: StateKey
+    word: tuple[int, ...]
+    occurrence_count: int
+    occurrences_per_relator: tuple[int, ...]
+    occurrence_positions: tuple[tuple[tuple[int, int], ...], ...]
+    excess_gain: int
+    max_relator_gain: int
+    cancellation_count: int
+    relator_spread: int
+    isolated_generator_count: int
+
+
+@dataclass(frozen=True)
+class MacroGeneration:
+    candidates: list[MacroCandidate]
+    generated_count: int
+    eligible_count: int
 
 
 @dataclass(frozen=True)
@@ -168,6 +201,11 @@ def format_word(word: Sequence[int]) -> str:
 
 def state_total_length(key: StateKey) -> int:
     return sum(len(word) for word in key[1])
+
+
+def state_excess_length(key: StateKey) -> int:
+    """Length above the trivial balanced presentation at the same rank."""
+    return state_total_length(key) - key[0]
 
 
 def letter_order(code: int, active_n_gen: int) -> int:
@@ -228,6 +266,217 @@ def canonicalize_relators(
     return tuple(
         sorted(canon, key=lambda w: (len(w), word_order_key(w, active_n_gen)))
     )
+
+
+def canonical_linear_word(
+    word: Sequence[int], active_n_gen: int
+) -> tuple[int, ...]:
+    """Canonicalize a based word up to inversion, but not cyclic rotation."""
+    normal = tuple(int(code) for code in word)
+    inverted = inverse_word(normal)
+    return min(normal, inverted, key=lambda w: word_order_key(w, active_n_gen))
+
+
+def cyclic_window(word: Sequence[int], start: int, length: int) -> tuple[int, ...]:
+    word = tuple(word)
+    if not word or length <= 0 or length > len(word):
+        return ()
+    return tuple(word[(start + offset) % len(word)] for offset in range(length))
+
+
+def substitute_generator_word(
+    word: Sequence[int], generator_code: int, replacement: Sequence[int]
+) -> tuple[int, ...]:
+    """Substitute a generator and its inverse in an ordinary Python word."""
+    replacement = tuple(replacement)
+    inverse_replacement = inverse_word(replacement)
+    out: list[int] = []
+    for code in word:
+        if code == generator_code:
+            out.extend(replacement)
+        elif code == -generator_code:
+            out.extend(inverse_replacement)
+        else:
+            out.append(int(code))
+    return free_reduce(out)
+
+
+def replace_cyclic_macro_occurrences(
+    word: Sequence[int], macro_word: Sequence[int], new_code: int
+) -> tuple[tuple[int, ...], int, int, tuple[tuple[int, int], ...]]:
+    """Replace a deterministic maximum set of cyclic macro occurrences.
+
+    Every cut of the cyclic relator is considered. Equal-length intervals make
+    left-to-right selection maximum-cardinality for a fixed cut. We retain the
+    result with most replacements, then shortest reduced length, then canonical
+    word order.
+    """
+    word = tuple(word)
+    macro_word = tuple(macro_word)
+    if not word or not macro_word or len(macro_word) > len(word):
+        reduced = canonical_word(word, new_code)
+        return reduced, 0, len(word), ()
+
+    inverse_macro = inverse_word(macro_word)
+    best: tuple[
+        tuple, tuple[int, ...], int, int, tuple[tuple[int, int], ...]
+    ] | None = None
+    n = len(word)
+    width = len(macro_word)
+    for cut in range(n):
+        rotated = word[cut:] + word[:cut]
+        raw: list[int] = []
+        selected_positions: list[tuple[int, int]] = []
+        replacements = 0
+        cursor = 0
+        while cursor < n:
+            segment = rotated[cursor : cursor + width]
+            if len(segment) == width and segment == macro_word:
+                raw.append(new_code)
+                selected_positions.append(((cut + cursor) % n, 1))
+                replacements += 1
+                cursor += width
+            elif len(segment) == width and segment == inverse_macro:
+                raw.append(-new_code)
+                selected_positions.append(((cut + cursor) % n, -1))
+                replacements += 1
+                cursor += width
+            else:
+                raw.append(rotated[cursor])
+                cursor += 1
+
+        reduced = canonical_word(raw, new_code)
+        rank = (
+            -replacements,
+            len(reduced),
+            word_order_key(reduced, new_code),
+        )
+        candidate = (
+            rank,
+            reduced,
+            replacements,
+            len(raw),
+            tuple(selected_positions),
+        )
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+
+    assert best is not None
+    _, reduced, replacements, raw_length, selected_positions = best
+    return reduced, replacements, raw_length, selected_positions
+
+
+def macro_roundtrip_valid(
+    before: StateKey, after: StateKey, macro_word: Sequence[int]
+) -> bool:
+    """Check the defining Tietze expansion by eliminating the new generator."""
+    old_n_gen = before[0]
+    new_code = old_n_gen + 1
+    eliminated = []
+    for relator in after[1]:
+        restored = cyclic_reduce(
+            substitute_generator_word(relator, new_code, macro_word)
+        )
+        if restored:
+            eliminated.append(restored)
+    if len(eliminated) != old_n_gen:
+        return False
+    return canonicalize_relators(eliminated, old_n_gen) == before[1]
+
+
+def build_macro_candidate(
+    key: StateKey,
+    action: Action,
+    macro_word: Sequence[int],
+    max_length: int,
+    min_occurrences: int,
+) -> MacroCandidate | None:
+    """Apply the valid Tietze expansion z=w and score its exact result."""
+    active_n_gen, relators = key
+    new_n_gen = active_n_gen + 1
+    new_code = new_n_gen
+    macro_word = canonical_linear_word(macro_word, active_n_gen)
+    if not macro_word or free_reduce(macro_word) != macro_word:
+        return None
+
+    transformed: list[tuple[int, ...]] = []
+    occurrences_per_relator: list[int] = []
+    occurrence_positions: list[tuple[tuple[int, int], ...]] = []
+    raw_total = 0
+    for relator in relators:
+        (
+            new_relator,
+            occurrences,
+            raw_length,
+            selected_positions,
+        ) = replace_cyclic_macro_occurrences(relator, macro_word, new_code)
+        transformed.append(new_relator)
+        occurrences_per_relator.append(occurrences)
+        occurrence_positions.append(selected_positions)
+        raw_total += raw_length
+
+    occurrence_count = sum(occurrences_per_relator)
+    if occurrence_count < min_occurrences:
+        return None
+
+    definition = cyclic_reduce((new_code,) + inverse_word(macro_word))
+    transformed.append(definition)
+    raw_total += len(macro_word) + 1
+    if any(len(relator) > max_length for relator in transformed):
+        return None
+
+    next_key: StateKey = (
+        new_n_gen,
+        canonicalize_relators(transformed, new_n_gen),
+    )
+    if not macro_roundtrip_valid(key, next_key, macro_word):
+        raise AssertionError(
+            f"invalid macro round trip for w={macro_word}: {key} -> {next_key}"
+        )
+
+    before_max = max((len(word) for word in relators), default=0)
+    after_max = max((len(word) for word in next_key[1]), default=0)
+    isolated = sum(
+        sum(abs(code) == new_code for code in relator) == 1
+        for relator in transformed[:-1]
+    )
+    return MacroCandidate(
+        action=action,
+        next_key=next_key,
+        word=macro_word,
+        occurrence_count=occurrence_count,
+        occurrences_per_relator=tuple(occurrences_per_relator),
+        occurrence_positions=tuple(occurrence_positions),
+        excess_gain=state_excess_length(key) - state_excess_length(next_key),
+        max_relator_gain=before_max - after_max,
+        cancellation_count=max(0, raw_total - state_total_length(next_key)),
+        relator_spread=sum(count > 0 for count in occurrences_per_relator),
+        isolated_generator_count=isolated,
+    )
+
+
+def macro_candidate_sort_key(candidate: MacroCandidate) -> tuple:
+    return (
+        -candidate.excess_gain,
+        -candidate.max_relator_gain,
+        -candidate.cancellation_count,
+        -candidate.relator_spread,
+        -candidate.isolated_generator_count,
+        len(candidate.word),
+        candidate.word,
+    )
+
+
+def macro_gain_is_eligible(
+    gain: int, policy: str, relaxed_slack: int
+) -> bool:
+    if policy == "positive":
+        return gain > 0
+    if policy == "nonnegative":
+        return gain >= 0
+    if policy == "relaxed":
+        return gain >= -relaxed_slack
+    raise ValueError(f"unknown macro gain policy {policy!r}")
 
 
 def flat_to_relators(
@@ -400,6 +649,144 @@ def iter_actions(
         yield from iter_ac45_actions(key, max_n_gen, change_of_variables_moves)
 
 
+def macro_definition_branch(
+    max_n_gen: int, change_of_variables_moves: bool, ac45_moves: bool
+) -> int:
+    branch = num_substitution_branches(max_n_gen)
+    if change_of_variables_moves:
+        branch += num_change_of_variables_branches(max_n_gen)
+    if ac45_moves:
+        branch += 2
+    return branch
+
+
+def macro_candidate_from_action(
+    key: StateKey,
+    action: Action,
+    max_length: int,
+    min_occurrences: int,
+) -> MacroCandidate | None:
+    _, source_relator, start, length_code = action
+    active_n_gen, relators = key
+    if source_relator < 0 or source_relator >= len(relators):
+        return None
+    length = length_code + 1
+    macro_word = cyclic_window(relators[source_relator], start, length)
+    if not macro_word:
+        return None
+    return build_macro_candidate(
+        key, action, macro_word, max_length, min_occurrences
+    )
+
+
+def generate_macro_candidates(
+    key: StateKey,
+    max_n_gen: int,
+    max_length: int,
+    min_word_length: int,
+    max_word_length: int,
+    min_occurrences: int,
+    top_k: int,
+    gain_policy: str,
+    relaxed_slack: int,
+    change_of_variables_moves: bool,
+    ac45_moves: bool,
+) -> MacroGeneration:
+    active_n_gen, relators = key
+    if active_n_gen >= max_n_gen:
+        return MacroGeneration([], 0, 0)
+
+    branch = macro_definition_branch(
+        max_n_gen, change_of_variables_moves, ac45_moves
+    )
+    actions_by_word: dict[tuple[int, ...], Action] = {}
+    for relator_idx, relator in enumerate(relators):
+        upper = min(max_word_length, len(relator))
+        for length in range(min_word_length, upper + 1):
+            for start in range(len(relator)):
+                raw_word = cyclic_window(relator, start, length)
+                if free_reduce(raw_word) != raw_word:
+                    continue
+                word = canonical_linear_word(raw_word, active_n_gen)
+                actions_by_word.setdefault(
+                    word, (branch, relator_idx, start, length - 1)
+                )
+
+    generated_count = len(actions_by_word)
+    eligible: list[MacroCandidate] = []
+    for word, action in actions_by_word.items():
+        candidate = build_macro_candidate(
+            key, action, word, max_length, min_occurrences
+        )
+        if candidate is None:
+            continue
+        if macro_gain_is_eligible(
+            candidate.excess_gain, gain_policy, relaxed_slack
+        ):
+            eligible.append(candidate)
+
+    eligible_count = len(eligible)
+    eligible.sort(key=macro_candidate_sort_key)
+    distinct: list[MacroCandidate] = []
+    seen_states: set[StateKey] = set()
+    for candidate in eligible:
+        if candidate.next_key in seen_states:
+            continue
+        distinct.append(candidate)
+        seen_states.add(candidate.next_key)
+        if len(distinct) >= top_k:
+            break
+    return MacroGeneration(distinct, generated_count, eligible_count)
+
+
+def macro_event_payload(
+    before: StateKey, candidate: MacroCandidate, step: int
+) -> dict:
+    _, source_relator, source_start, _ = candidate.action
+    return {
+        "step": int(step),
+        "word": [int(code) for code in candidate.word],
+        "word_text": format_word(candidate.word),
+        "word_length": len(candidate.word),
+        "occurrence_count": candidate.occurrence_count,
+        "occurrences_per_relator": list(candidate.occurrences_per_relator),
+        "occurrence_positions": [
+            [
+                {"start": int(start), "orientation": int(orientation)}
+                for start, orientation in relator_positions
+            ]
+            for relator_positions in candidate.occurrence_positions
+        ],
+        "source_relator": int(source_relator),
+        "source_start": int(source_start),
+        "excess_before": state_excess_length(before),
+        "excess_after": state_excess_length(candidate.next_key),
+        "excess_gain": candidate.excess_gain,
+        "total_length_before": state_total_length(before),
+        "total_length_after": state_total_length(candidate.next_key),
+        "max_relator_gain": candidate.max_relator_gain,
+        "cancellation_count": candidate.cancellation_count,
+        "relator_spread": candidate.relator_spread,
+        "isolated_generator_count": candidate.isolated_generator_count,
+        "active_n_gen_before": before[0],
+        "active_n_gen_after": candidate.next_key[0],
+        "presentation_before": [
+            [int(code) for code in relator] for relator in before[1]
+        ],
+        "presentation_after": [
+            [int(code) for code in relator] for relator in candidate.next_key[1]
+        ],
+        "presentation_before_text": [format_word(relator) for relator in before[1]],
+        "presentation_after_text": [
+            format_word(relator) for relator in candidate.next_key[1]
+        ],
+        "roundtrip_valid": macro_roundtrip_valid(
+            before, candidate.next_key, candidate.word
+        ),
+        "action": [int(value) for value in candidate.action],
+    }
+
+
 def build_apply_batch(
     params: MoveParams, change_of_variables_moves: bool, ac45_moves: bool
 ):
@@ -455,9 +842,18 @@ class GreedyNSolver:
         max_length: int,
         max_nodes: int,
         max_total_length: int,
+        max_excess_length: int | None,
         max_depth: int | None,
         change_of_variables_moves: bool,
         ac45_moves: bool,
+        macro_variable_moves: bool,
+        macro_min_word_length: int,
+        macro_max_word_length: int,
+        macro_min_occurrences: int,
+        macro_top_k: int,
+        macro_gain_policy: str,
+        macro_relaxed_slack: int,
+        priority_metric: str,
         chunk_size: int,
         verbose: bool,
         apply_batch=None,
@@ -466,9 +862,18 @@ class GreedyNSolver:
         self.max_length = max_length
         self.max_nodes = max_nodes
         self.max_total_length = max_total_length
+        self.max_excess_length = max_excess_length
         self.max_depth = max_depth
         self.change_of_variables_moves = change_of_variables_moves
         self.ac45_moves = ac45_moves
+        self.macro_variable_moves = macro_variable_moves
+        self.macro_min_word_length = macro_min_word_length
+        self.macro_max_word_length = macro_max_word_length
+        self.macro_min_occurrences = macro_min_occurrences
+        self.macro_top_k = macro_top_k
+        self.macro_gain_policy = macro_gain_policy
+        self.macro_relaxed_slack = macro_relaxed_slack
+        self.priority_metric = priority_metric
         self.chunk_size = chunk_size
         self.verbose = verbose
 
@@ -485,6 +890,39 @@ class GreedyNSolver:
             self.params, change_of_variables_moves, ac45_moves
         )
 
+    def _priority(self, key: StateKey) -> int:
+        if self.priority_metric == "excess":
+            return state_excess_length(key)
+        return state_total_length(key)
+
+    def _within_length_limit(self, key: StateKey) -> bool:
+        if self.max_excess_length is not None:
+            return state_excess_length(key) <= self.max_excess_length
+        return state_total_length(key) <= self.max_total_length
+
+    def _path_macro_events(
+        self, path_keys: Sequence[StateKey], path_actions: Sequence[Action]
+    ) -> list[dict]:
+        macro_branch = macro_definition_branch(
+            self.max_n_gen,
+            self.change_of_variables_moves,
+            self.ac45_moves,
+        )
+        events = []
+        for step, action in enumerate(path_actions):
+            if action[0] != macro_branch:
+                continue
+            candidate = macro_candidate_from_action(
+                path_keys[step],
+                action,
+                self.max_length,
+                self.macro_min_occurrences,
+            )
+            if candidate is None or candidate.next_key != path_keys[step + 1]:
+                raise AssertionError(f"macro action failed to replay at step {step}")
+            events.append(macro_event_payload(path_keys[step], candidate, step))
+        return events
+
     def solve(self) -> SearchResult:
         start_time = time.time()
         parents: dict[StateKey, tuple[StateKey | None, Action | None]] = {
@@ -493,10 +931,21 @@ class GreedyNSolver:
         flats: dict[StateKey, np.ndarray] = {self.initial_key: self.initial_flat}
         pq: list[tuple[int, int, int, StateKey]] = []
         seq = 0
-        heapq.heappush(pq, (state_total_length(self.initial_key), 0, seq, self.initial_key))
+        initial_priority = self._priority(self.initial_key)
+        heapq.heappush(pq, (initial_priority, 0, seq, self.initial_key))
         nodes_visited = 0
-        max_priority_seen = state_total_length(self.initial_key)
-        min_priority_seen = state_total_length(self.initial_key)
+        max_priority_seen = initial_priority
+        min_priority_seen = initial_priority
+        generated_count = 0
+        unique_successor_count = 0
+        noop_count = 0
+        duplicate_count = 0
+        limit_pruned_count = 0
+        peak_queue_size = 1
+        max_active_n_gen = self.initial_key[0]
+        macro_candidates_generated = 0
+        macro_candidates_eligible = 0
+        macro_successors_added = 0
 
         while pq and nodes_visited < self.max_nodes:
             priority, depth, _, key = heapq.heappop(pq)
@@ -530,6 +979,17 @@ class GreedyNSolver:
                     path_keys=path_keys,
                     path_actions=path_actions,
                     seen_count=len(parents),
+                    generated_count=generated_count,
+                    unique_successor_count=unique_successor_count,
+                    noop_count=noop_count,
+                    duplicate_count=duplicate_count,
+                    limit_pruned_count=limit_pruned_count,
+                    peak_queue_size=peak_queue_size,
+                    max_active_n_gen=max_active_n_gen,
+                    macro_candidates_generated=macro_candidates_generated,
+                    macro_candidates_eligible=macro_candidates_eligible,
+                    macro_successors_added=macro_successors_added,
+                    macro_events=self._path_macro_events(path_keys, path_actions),
                 )
 
             if self.max_depth is not None and depth >= self.max_depth:
@@ -547,19 +1007,70 @@ class GreedyNSolver:
             for action, next_flat, next_n_gen in apply_actions_chunked(
                 self.apply_batch, flat, active_n_gen, action_list, self.chunk_size
             ):
+                generated_count += 1
                 next_key, next_canon_flat = canonicalize_flat(
                     next_flat, next_n_gen, self.max_n_gen, self.max_length
                 )
-                if next_key == key or next_key in parents:
+                if next_key == key:
+                    noop_count += 1
                     continue
-                total_length = state_total_length(next_key)
-                if total_length > self.max_total_length:
+                if next_key in parents:
+                    duplicate_count += 1
+                    continue
+                if not self._within_length_limit(next_key):
+                    limit_pruned_count += 1
                     continue
 
                 parents[next_key] = (key, action)
                 flats[next_key] = next_canon_flat
                 seq += 1
-                heapq.heappush(pq, (total_length, depth + 1, seq, next_key))
+                heapq.heappush(
+                    pq, (self._priority(next_key), depth + 1, seq, next_key)
+                )
+                unique_successor_count += 1
+                max_active_n_gen = max(max_active_n_gen, next_key[0])
+
+            if self.macro_variable_moves:
+                macro_generation = generate_macro_candidates(
+                    key=key,
+                    max_n_gen=self.max_n_gen,
+                    max_length=self.max_length,
+                    min_word_length=self.macro_min_word_length,
+                    max_word_length=self.macro_max_word_length,
+                    min_occurrences=self.macro_min_occurrences,
+                    top_k=self.macro_top_k,
+                    gain_policy=self.macro_gain_policy,
+                    relaxed_slack=self.macro_relaxed_slack,
+                    change_of_variables_moves=self.change_of_variables_moves,
+                    ac45_moves=self.ac45_moves,
+                )
+                macro_candidates_generated += macro_generation.generated_count
+                macro_candidates_eligible += macro_generation.eligible_count
+                for candidate in macro_generation.candidates:
+                    generated_count += 1
+                    next_key = candidate.next_key
+                    if next_key == key:
+                        noop_count += 1
+                        continue
+                    if next_key in parents:
+                        duplicate_count += 1
+                        continue
+                    if not self._within_length_limit(next_key):
+                        limit_pruned_count += 1
+                        continue
+                    parents[next_key] = (key, candidate.action)
+                    flats[next_key] = key_to_flat(
+                        next_key, self.max_n_gen, self.max_length
+                    )
+                    seq += 1
+                    heapq.heappush(
+                        pq, (self._priority(next_key), depth + 1, seq, next_key)
+                    )
+                    unique_successor_count += 1
+                    macro_successors_added += 1
+                    max_active_n_gen = max(max_active_n_gen, next_key[0])
+
+            peak_queue_size = max(peak_queue_size, len(pq))
 
         elapsed = time.time() - start_time
         return SearchResult(
@@ -570,6 +1081,17 @@ class GreedyNSolver:
             path_keys=[],
             path_actions=[],
             seen_count=len(parents),
+            generated_count=generated_count,
+            unique_successor_count=unique_successor_count,
+            noop_count=noop_count,
+            duplicate_count=duplicate_count,
+            limit_pruned_count=limit_pruned_count,
+            peak_queue_size=peak_queue_size,
+            max_active_n_gen=max_active_n_gen,
+            macro_candidates_generated=macro_candidates_generated,
+            macro_candidates_eligible=macro_candidates_eligible,
+            macro_successors_added=macro_successors_added,
+            macro_events=[],
         )
 
     @staticmethod
@@ -701,6 +1223,7 @@ def format_action(
     max_n_gen: int,
     change_of_variables_moves: bool,
     ac45_moves: bool,
+    macro_variable_moves: bool = False,
 ) -> str:
     branch, a1, a2, a3 = action
     s_branches = num_substitution_branches(max_n_gen)
@@ -730,20 +1253,50 @@ def format_action(
         return "AC4(add_generator)"
     if ac45_moves and branch == delete_generator_branch(max_n_gen, change_of_variables_moves):
         return f"AC5(delete_gen={a1})"
+    if macro_variable_moves and branch == macro_definition_branch(
+        max_n_gen, change_of_variables_moves, ac45_moves
+    ):
+        return (
+            f"MACRO(source_relator={a1}, start={a2}, "
+            f"word_length={a3 + 1})"
+        )
     return f"unknown_action{action}"
 
 
 def result_payload(result: SearchResult, idx: int | None = None) -> dict:
+    initial_active_n_gen = result.path_keys[0][0] if result.path_keys else None
+    final_active_n_gen = result.final_key[0] if result.final_key is not None else None
     payload = {
         "solved": result.solved,
         "nodes_visited": result.nodes_visited,
         "seen_count": result.seen_count,
+        "generated_count": result.generated_count,
+        "unique_successor_count": result.unique_successor_count,
+        "noop_count": result.noop_count,
+        "duplicate_count": result.duplicate_count,
+        "limit_pruned_count": result.limit_pruned_count,
+        "effective_branching_factor": (
+            result.unique_successor_count / max(result.nodes_visited, 1)
+        ),
+        "peak_queue_size": result.peak_queue_size,
+        "max_active_n_gen": result.max_active_n_gen,
+        "initial_active_n_gen": initial_active_n_gen,
+        "final_active_n_gen": final_active_n_gen,
+        "solved_at_initial_rank": bool(
+            result.solved and final_active_n_gen == initial_active_n_gen
+        ),
+        "macro_candidates_generated": result.macro_candidates_generated,
+        "macro_candidates_eligible": result.macro_candidates_eligible,
+        "macro_successors_added": result.macro_successors_added,
+        "macro_events": result.macro_events or [],
+        "macro_moves_in_solution": len(result.macro_events or []),
         "elapsed_sec": result.elapsed_sec,
         "path_length": len(result.path_actions) if result.solved else -1,
         "path": [
             [[int(v) for v in word] for word in key[1]]
             for key in result.path_keys
         ],
+        "path_n_gen": [int(key[0]) for key in result.path_keys],
         "actions": [list(map(int, action)) for action in result.path_actions],
     }
     if idx is not None:
@@ -772,15 +1325,27 @@ def init_wandb_run(
         "all": args.all,
         "start": args.start,
         "end": args.end,
+        "index_modulus": args.index_modulus,
+        "index_remainder": args.index_remainder,
+        "index_remainders": args.index_remainders,
         "n_gen": args.n_gen,
         "max_n_gen": args.max_n_gen,
         "max_length": args.max_length,
         "max_total_length": args.max_total_length,
+        "max_excess_length": args.max_excess_length,
         "max_nodes": args.max_nodes,
         "max_depth": args.max_depth,
         "chunk_size": args.chunk_size,
         "change_of_variables_moves": change_of_variables_moves,
         "ac45_moves": ac45_moves,
+        "macro_variable_moves": args.macro_variable_moves,
+        "macro_min_word_length": args.macro_min_word_length,
+        "macro_max_word_length": args.macro_max_word_length,
+        "macro_min_occurrences": args.macro_min_occurrences,
+        "macro_top_k": args.macro_top_k,
+        "macro_gain_policy": args.macro_gain_policy,
+        "macro_relaxed_slack": args.macro_relaxed_slack,
+        "priority_metric": args.priority_metric,
         "stable_ac_moves": args.stable_ac_moves,
         "compare_cov": args.compare_cov,
         "compare_cov_paths": args.compare_cov_paths,
@@ -831,6 +1396,7 @@ def emit_result(
     max_length: int,
     change_of_variables_moves: bool,
     ac45_moves: bool,
+    macro_variable_moves: bool,
     show_path: bool,
     print_packed: bool,
     out_json: str | None,
@@ -855,7 +1421,11 @@ def emit_result(
                 print(
                     "  "
                     + format_action(
-                        action, max_n_gen, change_of_variables_moves, ac45_moves
+                        action,
+                        max_n_gen,
+                        change_of_variables_moves,
+                        ac45_moves,
+                        macro_variable_moves,
                     )
                 )
 
@@ -897,9 +1467,18 @@ def make_solver(
         max_length=args.max_length,
         max_nodes=args.max_nodes,
         max_total_length=args.max_total_length,
+        max_excess_length=args.max_excess_length,
         max_depth=args.max_depth,
         change_of_variables_moves=change_of_variables_moves,
         ac45_moves=ac45_moves,
+        macro_variable_moves=args.macro_variable_moves,
+        macro_min_word_length=args.macro_min_word_length,
+        macro_max_word_length=args.macro_max_word_length,
+        macro_min_occurrences=args.macro_min_occurrences,
+        macro_top_k=args.macro_top_k,
+        macro_gain_policy=args.macro_gain_policy,
+        macro_relaxed_slack=args.macro_relaxed_slack,
+        priority_metric=args.priority_metric,
         chunk_size=args.chunk_size,
         verbose=verbose,
         apply_batch=apply_batch,
@@ -914,6 +1493,10 @@ def solve_dataset_row(
     apply_batch_cache: dict,
     verbose: bool = False,
 ) -> SearchResult:
+    if args.macro_variable_moves and row.n_gen >= row.max_n_gen:
+        raise ValueError(
+            "macro variable moves require max_n_gen >= initial n_gen + 1"
+        )
     cache_key = (
         row.max_n_gen,
         args.max_length,
@@ -948,6 +1531,17 @@ def capped_indices(indices: Sequence[int], limit: int) -> list[int]:
     if limit <= 0:
         return []
     return [int(idx) for idx in indices[:limit]]
+
+
+def dataset_index_selected(args: argparse.Namespace, idx: int) -> bool:
+    if args.index_modulus is None:
+        return True
+    allowed = (
+        set(args.index_remainders)
+        if args.index_remainders is not None
+        else {args.index_remainder}
+    )
+    return idx % args.index_modulus in allowed
 
 
 def add_index_summaries(wandb_run, prefix: str, indices: Sequence[int],
@@ -1007,6 +1601,8 @@ def run_dataset_batch(
             args.max_n_gen,
             args.max_length,
         ):
+            if not dataset_index_selected(args, row.idx):
+                continue
             result = solve_dataset_row(
                 row,
                 args,
@@ -1081,6 +1677,14 @@ def run_dataset_batch(
                         "rows_per_second": total / max(elapsed_so_far, 1e-9),
                         "active_n_gen": row.n_gen,
                         "max_n_gen": row.max_n_gen,
+                        "macro_moves_in_solution": len(result.macro_events or []),
+                        "macro_candidates_generated": result.macro_candidates_generated,
+                        "macro_candidates_eligible": result.macro_candidates_eligible,
+                        "macro_successors_added": result.macro_successors_added,
+                        "effective_branching_factor": (
+                            result.unique_successor_count
+                            / max(result.nodes_visited, 1)
+                        ),
                     },
                     step=total,
                 )
@@ -1217,6 +1821,8 @@ def run_cov_comparison(args: argparse.Namespace, ac45_moves: bool) -> None:
             args.max_n_gen,
             args.max_length,
         ):
+            if not dataset_index_selected(args, row.idx):
+                continue
             without_cov = solve_dataset_row(
                 row, args, False, ac45_moves, apply_batch_cache
             )
@@ -1428,15 +2034,59 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="exclusive end dataset index; omit with --all to run to EOF",
     )
+    parser.add_argument(
+        "--index_modulus",
+        type=int,
+        default=None,
+        help="process only indices with idx %% modulus == remainder",
+    )
+    parser.add_argument("--index_remainder", type=int, default=0)
+    parser.add_argument(
+        "--index_remainders",
+        type=int,
+        nargs="+",
+        default=None,
+        help="optional set of accepted remainders; overrides --index_remainder",
+    )
     parser.add_argument("--n_gen", type=int, default=None)
     parser.add_argument("--max_n_gen", type=int, default=None)
     parser.add_argument("--max_length", type=int, default=24)
     parser.add_argument("--max_total_length", type=int, default=100)
+    parser.add_argument(
+        "--max_excess_length",
+        type=int,
+        default=None,
+        help=(
+            "optional rank-normalized length limit sum(|R_i|)-active_n_gen; "
+            "when set, replaces --max_total_length as the pruning limit"
+        ),
+    )
     parser.add_argument("--max_nodes", type=int, default=10000)
     parser.add_argument("--max_depth", type=int, default=None)
     parser.add_argument("--chunk_size", type=int, default=4096)
     parser.add_argument("--change_of_variables_moves", action="store_true")
     parser.add_argument("--ac45_moves", action="store_true")
+    parser.add_argument(
+        "--macro_variable_moves",
+        action="store_true",
+        help="enable definitional Tietze expansions z=w as ranked supermoves",
+    )
+    parser.add_argument("--macro_min_word_length", type=int, default=2)
+    parser.add_argument("--macro_max_word_length", type=int, default=5)
+    parser.add_argument("--macro_min_occurrences", type=int, default=2)
+    parser.add_argument("--macro_top_k", type=int, default=3)
+    parser.add_argument(
+        "--macro_gain_policy",
+        choices=["positive", "nonnegative", "relaxed"],
+        default="nonnegative",
+    )
+    parser.add_argument("--macro_relaxed_slack", type=int, default=2)
+    parser.add_argument(
+        "--priority_metric",
+        choices=["total", "excess"],
+        default="total",
+        help="queue priority; excess is recommended when rank-changing moves are enabled",
+    )
     parser.add_argument(
         "--stable_ac_moves",
         action="store_true",
@@ -1519,6 +2169,24 @@ def main() -> None:
         raise SystemExit("--max_nodes must be positive")
     if args.max_length <= 0 or args.max_total_length <= 0:
         raise SystemExit("--max_length and --max_total_length must be positive")
+    if args.max_excess_length is not None and args.max_excess_length < 0:
+        raise SystemExit("--max_excess_length must be non-negative")
+    if args.macro_min_word_length <= 0:
+        raise SystemExit("--macro_min_word_length must be positive")
+    if args.macro_max_word_length < args.macro_min_word_length:
+        raise SystemExit(
+            "--macro_max_word_length must be >= --macro_min_word_length"
+        )
+    if args.macro_min_occurrences < 2:
+        raise SystemExit("--macro_min_occurrences must be at least 2")
+    if args.macro_top_k <= 0:
+        raise SystemExit("--macro_top_k must be positive")
+    if args.macro_relaxed_slack < 0:
+        raise SystemExit("--macro_relaxed_slack must be non-negative")
+    if args.macro_variable_moves and args.print_packed:
+        raise SystemExit(
+            "--print_packed is not available for state-dependent macro actions"
+        )
     if args.chunk_size <= 0:
         raise SystemExit("--chunk_size must be positive")
     if args.wandb_log_every <= 0:
@@ -1527,6 +2195,20 @@ def main() -> None:
         raise SystemExit("--wandb_window must be positive")
     if args.index_summary_limit < 0:
         raise SystemExit("--index_summary_limit must be non-negative")
+    if args.index_modulus is not None:
+        if args.index_modulus <= 0:
+            raise SystemExit("--index_modulus must be positive")
+        if not 0 <= args.index_remainder < args.index_modulus:
+            raise SystemExit(
+                "--index_remainder must satisfy 0 <= remainder < modulus"
+            )
+        if args.index_remainders is not None and any(
+            remainder < 0 or remainder >= args.index_modulus
+            for remainder in args.index_remainders
+        ):
+            raise SystemExit(
+                "every --index_remainders value must be in [0, modulus)"
+            )
     if args.relators is not None and (args.all or args.start is not None or args.end is not None):
         raise SystemExit("--all/--start/--end only apply with --dataset")
     if args.compare_cov and args.relators is not None:
@@ -1535,6 +2217,16 @@ def main() -> None:
         raise SystemExit("--compare_cov requires --dataset")
     if args.out_jsonl is not None and args.dataset is None:
         raise SystemExit("--out_jsonl only applies with --dataset batch mode")
+
+    if args.macro_variable_moves and args.max_n_gen is None:
+        if args.relators is not None:
+            inferred_n = args.n_gen or len(args.relators)
+        else:
+            probe_idx = args.start if args.start is not None else args.idx
+            _, inferred_n, _ = load_dataset_presentation(
+                args.dataset, probe_idx, args.n_gen, None, args.max_length
+            )
+        args.max_n_gen = inferred_n + 1
 
     comparison_mode = args.compare_cov
     batch_mode = args.dataset is not None and (
@@ -1565,6 +2257,10 @@ def main() -> None:
         max_n_gen = max(max_n_gen, n_gen)
     if n_gen > max_n_gen:
         raise SystemExit("--n_gen must be <= --max_n_gen")
+    if args.macro_variable_moves and n_gen >= max_n_gen:
+        raise SystemExit(
+            "macro variable moves require --max_n_gen >= initial n_gen + 1"
+        )
 
     solver = make_solver(
         initial_flat=initial_flat,
@@ -1580,7 +2276,8 @@ def main() -> None:
             "Initial "
             + format_state(solver.initial_key)
             + f"; max_n_gen={max_n_gen}, max_length={args.max_length}, "
-            + f"COV={change_of_variables_moves}, AC45={ac45_moves}",
+            + f"COV={change_of_variables_moves}, AC45={ac45_moves}, "
+            + f"macro={args.macro_variable_moves}",
             flush=True,
         )
     wandb_run = init_wandb_run(
@@ -1600,6 +2297,7 @@ def main() -> None:
         max_length=args.max_length,
         change_of_variables_moves=change_of_variables_moves,
         ac45_moves=ac45_moves,
+        macro_variable_moves=args.macro_variable_moves,
         show_path=args.show_path,
         print_packed=args.print_packed,
         out_json=args.out_json,
