@@ -142,18 +142,10 @@ class SeededPresentation:
 
 
 @dataclass(frozen=True)
-class SeededCovSuccessor:
-    seed: SeededPresentation
-    cov_action: Action
-    key: StateKey
-    flat: np.ndarray
-
-
-@dataclass(frozen=True)
-class SeededCovFrontier:
+class SeededSearchFrontier:
     seeds: list[SeededPresentation]
-    successors: list[SeededCovSuccessor]
-    valid_before_dedup: int
+    trivial_stabilization_key: StateKey
+    candidate_count: int
     duplicate_count: int
 
 
@@ -170,6 +162,7 @@ class SearchResult:
     seeded_cov_seed_count: int = 0
     seeded_cov_frontier_size: int = 0
     seeded_cov_duplicate_count: int = 0
+    seeded_cov_trivial_stabilization: StateKey | None = None
 
 
 @dataclass(frozen=True)
@@ -380,6 +373,25 @@ def build_seeded_presentation(
     )
 
 
+def build_trivial_stabilization(
+    original_relators: Sequence[Sequence[int]],
+    max_n_gen: int,
+    max_length: int,
+) -> StateKey:
+    """Return canonical <x,y,z | r1,r2,z>."""
+    if len(original_relators) != 2:
+        raise ValueError("trivial stabilization requires a rank-two presentation")
+    if max_n_gen < 3:
+        raise ValueError("trivial stabilization requires max_n_gen >= 3")
+    return (
+        3,
+        canonicalize_relators(
+            [*original_relators, (3,)],
+            active_n_gen=3,
+        ),
+    )
+
+
 def is_trivial_key(key: StateKey) -> bool:
     active_n_gen, relators = key
     if len(relators) != active_n_gen:
@@ -457,7 +469,13 @@ def cyclic_subword_complement(
     return rotated[length:]
 
 
-def iter_change_of_variables_actions(key: StateKey, max_n_gen: int) -> Iterator[Action]:
+def iter_change_of_variables_actions(
+    key: StateKey,
+    max_n_gen: int,
+    cov_window_min_length: int = 1,
+    cov_window_max_length: int | None = None,
+    cov_window_relator_margin: int = 1,
+) -> Iterator[Action]:
     active_n_gen, relators = key
     for remove_gen in range(active_n_gen):
         old_code = remove_gen + 1
@@ -466,8 +484,11 @@ def iter_change_of_variables_actions(key: StateKey, max_n_gen: int) -> Iterator[
             if rel_len <= 1:
                 continue
             branch = change_of_variables_branch(remove_gen, iso_relator, max_n_gen)
+            max_z_len = rel_len - cov_window_relator_margin
+            if cov_window_max_length is not None:
+                max_z_len = min(max_z_len, cov_window_max_length)
             for z_start in range(rel_len):
-                for z_len in range(1, rel_len):
+                for z_len in range(cov_window_min_length, max_z_len + 1):
                     complement = cyclic_subword_complement(word, z_start, z_len)
                     if sum(1 for code in complement if abs(code) == old_code) != 1:
                         continue
@@ -507,10 +528,19 @@ def iter_actions(
     max_n_gen: int,
     change_of_variables_moves: bool,
     ac45_moves: bool,
+    cov_window_min_length: int = 1,
+    cov_window_max_length: int | None = None,
+    cov_window_relator_margin: int = 1,
 ) -> Iterator[Action]:
     yield from iter_substitution_actions(key, max_n_gen)
     if change_of_variables_moves:
-        yield from iter_change_of_variables_actions(key, max_n_gen)
+        yield from iter_change_of_variables_actions(
+            key,
+            max_n_gen,
+            cov_window_min_length,
+            cov_window_max_length,
+            cov_window_relator_margin,
+        )
     if ac45_moves:
         yield from iter_ac45_actions(key, max_n_gen, change_of_variables_moves)
 
@@ -561,17 +591,24 @@ def apply_actions_chunked(
             yield actions[start + offset], next_x_np[offset], int(next_n_np[offset])
 
 
-def build_seeded_cov_frontier(
+def build_seeded_search_frontier(
     initial_key: StateKey,
     original_relators: Sequence[Sequence[int]],
     max_n_gen: int,
     max_length: int,
     max_total_length: int,
-    chunk_size: int,
-    apply_batch,
-) -> SeededCovFrontier:
-    """Build the root-only frontier after z w followed by one COV move."""
-    seeds = []
+) -> SeededSearchFrontier:
+    """Build unique root seed states while reserving the trivial stabilization."""
+    trivial_stabilization_key = build_trivial_stabilization(
+        original_relators,
+        max_n_gen,
+        max_length,
+    )
+    blocked_or_seen = {initial_key, trivial_stabilization_key}
+    seeds: list[SeededPresentation] = []
+    candidate_count = 0
+    duplicate_count = 0
+
     for seed_word in seeded_cov_word_candidates(original_relators):
         seeded = build_seeded_presentation(
             original_relators,
@@ -579,53 +616,21 @@ def build_seeded_cov_frontier(
             max_n_gen,
             max_length,
         )
-        if seeded is not None:
-            seeds.append(seeded)
+        if seeded is None:
+            continue
+        candidate_count += 1
+        if state_total_length(seeded.key) > max_total_length:
+            continue
+        if seeded.key in blocked_or_seen:
+            duplicate_count += 1
+            continue
+        blocked_or_seen.add(seeded.key)
+        seeds.append(seeded)
 
-    blocked_keys = {initial_key, *(seed.key for seed in seeds)}
-    seen_successors: set[StateKey] = set()
-    successors: list[SeededCovSuccessor] = []
-    valid_before_dedup = 0
-    duplicate_count = 0
-
-    for seed in seeds:
-        cov_actions = list(iter_change_of_variables_actions(seed.key, max_n_gen))
-        for cov_action, next_flat, next_n_gen in apply_actions_chunked(
-            apply_batch,
-            seed.flat,
-            seed.key[0],
-            cov_actions,
-            chunk_size,
-        ):
-            next_key, next_canon_flat = canonicalize_flat(
-                next_flat,
-                next_n_gen,
-                max_n_gen,
-                max_length,
-            )
-            if next_key == seed.key:
-                continue
-            if state_total_length(next_key) > max_total_length:
-                continue
-
-            valid_before_dedup += 1
-            if next_key in blocked_keys or next_key in seen_successors:
-                duplicate_count += 1
-                continue
-            seen_successors.add(next_key)
-            successors.append(
-                SeededCovSuccessor(
-                    seed=seed,
-                    cov_action=cov_action,
-                    key=next_key,
-                    flat=next_canon_flat,
-                )
-            )
-
-    return SeededCovFrontier(
+    return SeededSearchFrontier(
         seeds=seeds,
-        successors=successors,
-        valid_before_dedup=valid_before_dedup,
+        trivial_stabilization_key=trivial_stabilization_key,
+        candidate_count=candidate_count,
         duplicate_count=duplicate_count,
     )
 
@@ -646,6 +651,9 @@ class GreedyNSolver:
         verbose: bool,
         apply_batch=None,
         seeded_cov_moves: bool = False,
+        cov_window_min_length: int = 1,
+        cov_window_max_length: int | None = None,
+        cov_window_relator_margin: int = 1,
     ):
         self.max_n_gen = max_n_gen
         self.max_length = max_length
@@ -655,12 +663,15 @@ class GreedyNSolver:
         self.change_of_variables_moves = change_of_variables_moves
         self.ac45_moves = ac45_moves
         self.seeded_cov_moves = seeded_cov_moves
+        self.cov_window_min_length = cov_window_min_length
+        self.cov_window_max_length = cov_window_max_length
+        self.cov_window_relator_margin = cov_window_relator_margin
         self.chunk_size = chunk_size
         self.verbose = verbose
         self.original_relators = tuple(
             flat_to_relators(initial_flat, n_gen, max_length)
         )
-        self.seeded_frontier: SeededCovFrontier | None = None
+        self.seeded_frontier: SeededSearchFrontier | None = None
 
         if seeded_cov_moves and n_gen != 2:
             raise ValueError("--seeded_cov_moves requires an initial rank-two presentation")
@@ -691,30 +702,21 @@ class GreedyNSolver:
         pq: list[tuple[int, int, int, StateKey]] = []
         seq = 0
         if self.seeded_cov_moves:
-            self.seeded_frontier = build_seeded_cov_frontier(
+            self.seeded_frontier = build_seeded_search_frontier(
                 initial_key=self.initial_key,
                 original_relators=self.original_relators,
                 max_n_gen=self.max_n_gen,
                 max_length=self.max_length,
                 max_total_length=self.max_total_length,
-                chunk_size=self.chunk_size,
-                apply_batch=self.apply_batch,
             )
+            parents[self.seeded_frontier.trivial_stabilization_key] = (None, None)
             for seed in self.seeded_frontier.seeds:
-                parents.setdefault(seed.key, (self.initial_key, seed.action))
-                flats.setdefault(seed.key, seed.flat)
-            for successor in self.seeded_frontier.successors:
-                if successor.key in parents:
-                    continue
-                parents[successor.key] = (
-                    successor.seed.key,
-                    successor.cov_action,
-                )
-                flats[successor.key] = successor.flat
+                parents[seed.key] = (self.initial_key, seed.action)
+                flats[seed.key] = seed.flat
                 seq += 1
                 heapq.heappush(
                     pq,
-                    (state_total_length(successor.key), 2, seq, successor.key),
+                    (state_total_length(seed.key), 1, seq, seed.key),
                 )
         else:
             heapq.heappush(
@@ -759,16 +761,20 @@ class GreedyNSolver:
                     seen_count=len(parents),
                     seeded_cov_enabled=self.seeded_cov_moves,
                     seeded_cov_seed_count=(
-                        len(self.seeded_frontier.seeds)
+                        self.seeded_frontier.candidate_count
                         if self.seeded_frontier is not None else 0
                     ),
                     seeded_cov_frontier_size=(
-                        len(self.seeded_frontier.successors)
+                        len(self.seeded_frontier.seeds)
                         if self.seeded_frontier is not None else 0
                     ),
                     seeded_cov_duplicate_count=(
                         self.seeded_frontier.duplicate_count
                         if self.seeded_frontier is not None else 0
+                    ),
+                    seeded_cov_trivial_stabilization=(
+                        self.seeded_frontier.trivial_stabilization_key
+                        if self.seeded_frontier is not None else None
                     ),
                 )
 
@@ -781,6 +787,9 @@ class GreedyNSolver:
                     self.max_n_gen,
                     self.change_of_variables_moves,
                     self.ac45_moves,
+                    self.cov_window_min_length,
+                    self.cov_window_max_length,
+                    self.cov_window_relator_margin,
                 )
             )
             flat = flats[key]
@@ -812,16 +821,20 @@ class GreedyNSolver:
             seen_count=len(parents),
             seeded_cov_enabled=self.seeded_cov_moves,
             seeded_cov_seed_count=(
-                len(self.seeded_frontier.seeds)
+                self.seeded_frontier.candidate_count
                 if self.seeded_frontier is not None else 0
             ),
             seeded_cov_frontier_size=(
-                len(self.seeded_frontier.successors)
+                len(self.seeded_frontier.seeds)
                 if self.seeded_frontier is not None else 0
             ),
             seeded_cov_duplicate_count=(
                 self.seeded_frontier.duplicate_count
                 if self.seeded_frontier is not None else 0
+            ),
+            seeded_cov_trivial_stabilization=(
+                self.seeded_frontier.trivial_stabilization_key
+                if self.seeded_frontier is not None else None
             ),
         )
 
@@ -1020,17 +1033,19 @@ def seeded_cov_solution_metadata(result: SearchResult) -> dict | None:
     if not isinstance(seed_action, SeededCovAction):
         return None
     if len(result.path_actions) < 2 or len(result.path_keys) < 3:
-        raise AssertionError("seeded COV path is missing its first COV step")
-    first_cov_action = result.path_actions[1]
-    if isinstance(first_cov_action, SeededCovAction):
-        raise AssertionError("seeded COV was applied more than once")
+        raise AssertionError("seeded search path is missing its first search step")
+    first_search_action = result.path_actions[1]
+    if isinstance(first_search_action, SeededCovAction):
+        raise AssertionError("seeded-variable addition was applied more than once")
     return {
         "word": [int(code) for code in seed_action.word],
         "word_text": format_word(seed_action.word),
         "sources": list(seed_action.sources),
         "seeded_presentation": presentation_payload(result.path_keys[1]),
-        "first_cov_action": [int(value) for value in first_cov_action],
-        "post_cov_presentation": presentation_payload(result.path_keys[2]),
+        "first_search_action": [int(value) for value in first_search_action],
+        "post_first_action_presentation": presentation_payload(
+            result.path_keys[2]
+        ),
     }
 
 
@@ -1052,6 +1067,10 @@ def result_payload(result: SearchResult, idx: int | None = None) -> dict:
             "seed_count": result.seeded_cov_seed_count,
             "initial_frontier_size": result.seeded_cov_frontier_size,
             "duplicates_removed": result.seeded_cov_duplicate_count,
+            "previsited_trivial_stabilization": (
+                presentation_payload(result.seeded_cov_trivial_stabilization)
+                if result.seeded_cov_trivial_stabilization is not None else None
+            ),
             "solution": seeded_cov_solution_metadata(result),
         }
     if idx is not None:
@@ -1087,6 +1106,9 @@ def init_wandb_run(
         "max_nodes": args.max_nodes,
         "max_depth": args.max_depth,
         "chunk_size": args.chunk_size,
+        "cov_window_min_length": args.cov_window_min_length,
+        "cov_window_max_length": args.cov_window_max_length,
+        "cov_window_relator_margin": args.cov_window_relator_margin,
         "change_of_variables_moves": change_of_variables_moves,
         "seeded_cov_moves": args.seeded_cov_moves,
         "ac45_moves": ac45_moves,
@@ -1210,6 +1232,9 @@ def make_solver(
         change_of_variables_moves=change_of_variables_moves,
         ac45_moves=ac45_moves,
         seeded_cov_moves=args.seeded_cov_moves,
+        cov_window_min_length=args.cov_window_min_length,
+        cov_window_max_length=args.cov_window_max_length,
+        cov_window_relator_margin=args.cov_window_relator_margin,
         chunk_size=args.chunk_size,
         verbose=verbose,
         apply_batch=apply_batch,
@@ -1747,11 +1772,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk_size", type=int, default=4096)
     parser.add_argument("--change_of_variables_moves", action="store_true")
     parser.add_argument(
+        "--cov_window_min_length",
+        type=int,
+        default=1,
+        help="minimum COV window length (default: 1)",
+    )
+    parser.add_argument(
+        "--cov_window_max_length",
+        type=int,
+        default=None,
+        help=(
+            "optional absolute maximum COV window length; the relator margin "
+            "still applies"
+        ),
+    )
+    parser.add_argument(
+        "--cov_window_relator_margin",
+        type=int,
+        default=1,
+        help=(
+            "require len(W) <= len(isolating relator) - MARGIN "
+            "(default: 1)"
+        ),
+    )
+    parser.add_argument(
         "--seeded_cov_moves",
         action="store_true",
         help=(
-            "seed z w at the root, queue every valid first-COV successor, "
-            "then search with substitution and COV moves"
+            "queue root states with relator z w, previsit the trivial "
+            "stabilization, then search with substitution and COV moves"
         ),
     )
     parser.add_argument("--ac45_moves", action="store_true")
@@ -1876,6 +1925,35 @@ def main() -> None:
         raise SystemExit("--max_length and --max_total_length must be positive")
     if args.chunk_size <= 0:
         raise SystemExit("--chunk_size must be positive")
+    if args.cov_window_min_length < 1:
+        raise SystemExit("--cov_window_min_length must be positive")
+    if not 1 <= args.cov_window_relator_margin < args.max_length:
+        raise SystemExit(
+            "--cov_window_relator_margin must be between 1 and "
+            "--max_length - 1"
+        )
+    if args.cov_window_max_length is not None:
+        if not (
+            args.cov_window_min_length
+            <= args.cov_window_max_length
+            < args.max_length
+        ):
+            raise SystemExit(
+                "--cov_window_max_length must be at least "
+                "--cov_window_min_length and less than --max_length"
+            )
+    custom_cov_window_bounds = (
+        args.cov_window_min_length != 1
+        or args.cov_window_max_length is not None
+        or args.cov_window_relator_margin != 1
+    )
+    if custom_cov_window_bounds and not (
+        change_of_variables_moves or args.compare_cov
+    ):
+        raise SystemExit(
+            "custom COV window bounds require COV, seeded COV, "
+            "or --compare_cov"
+        )
     if args.wandb_log_every <= 0:
         raise SystemExit("--wandb_log_every must be positive")
     if args.wandb_window <= 0:
