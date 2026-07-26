@@ -36,8 +36,8 @@ import json
 import os
 import sys
 import time
-from collections import deque
-from dataclasses import dataclass
+from collections import Counter, deque
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Iterator, Sequence
 import types
@@ -163,6 +163,10 @@ class SearchResult:
     seeded_cov_frontier_size: int = 0
     seeded_cov_duplicate_count: int = 0
     seeded_cov_trivial_stabilization: StateKey | None = None
+    cheap_cov_label: str | None = None
+    cheap_cov_gate_checks: int = 0
+    cheap_cov_triggered_states: int = 0
+    cheap_cov_actions_enumerated: int = 0
 
 
 @dataclass(frozen=True)
@@ -179,6 +183,170 @@ class DatasetRow:
     flat: np.ndarray
     n_gen: int
     max_n_gen: int
+
+
+@dataclass(frozen=True)
+class ExpansionStats:
+    action_count: int
+    valid_successor_count: int
+    unique_successor_count: int
+    new_successor_count: int
+    duplicate_successor_count: int
+    shortening_successor_count: int
+
+    @property
+    def duplicate_ratio(self) -> float:
+        if self.valid_successor_count == 0:
+            return 1.0
+        return self.duplicate_successor_count / self.valid_successor_count
+
+
+@dataclass(frozen=True)
+class CheapCovContext:
+    node: int
+    depth: int
+    max_nodes: int
+    priority: int
+    initial_length: int
+    best_length: int
+    nodes_since_improvement: int
+    plateau_nodes: int
+    no_accepted_nodes: int
+    relator_stuck_nodes: int
+    recent_priorities: tuple[int, ...]
+    recent_duplicate_ratios: tuple[float, ...]
+
+
+@dataclass
+class CheapCovTracker:
+    initial_length: int
+    best_length: int
+    last_improvement_node: int = 0
+    previous_priority: int | None = None
+    plateau_nodes: int = 0
+    no_accepted_nodes: int = 0
+    previous_length_signature: tuple[int, ...] | None = None
+    relator_stuck_nodes: int = 0
+    recent_priorities: deque[int] = field(default_factory=lambda: deque(maxlen=6))
+    recent_duplicate_ratios: deque[float] = field(
+        default_factory=lambda: deque(maxlen=10)
+    )
+
+    def observe_pop(
+        self, key: StateKey, node: int, depth: int, max_nodes: int
+    ) -> CheapCovContext:
+        priority = state_total_length(key)
+        if priority < self.best_length:
+            self.best_length = priority
+            self.last_improvement_node = node
+
+        if self.previous_priority == priority:
+            self.plateau_nodes += 1
+        else:
+            self.plateau_nodes = 0
+        self.previous_priority = priority
+
+        signature = tuple(sorted(len(word) for word in key[1]))
+        if signature == self.previous_length_signature:
+            self.relator_stuck_nodes += 1
+        else:
+            self.relator_stuck_nodes = 0
+        self.previous_length_signature = signature
+        self.recent_priorities.append(priority)
+
+        return CheapCovContext(
+            node=node,
+            depth=depth,
+            max_nodes=max_nodes,
+            priority=priority,
+            initial_length=self.initial_length,
+            best_length=self.best_length,
+            nodes_since_improvement=node - self.last_improvement_node,
+            plateau_nodes=self.plateau_nodes,
+            no_accepted_nodes=self.no_accepted_nodes,
+            relator_stuck_nodes=self.relator_stuck_nodes,
+            recent_priorities=tuple(self.recent_priorities),
+            recent_duplicate_ratios=tuple(self.recent_duplicate_ratios),
+        )
+
+    def observe_expansion(self, stats: ExpansionStats) -> None:
+        if stats.new_successor_count == 0:
+            self.no_accepted_nodes += 1
+        else:
+            self.no_accepted_nodes = 0
+        self.recent_duplicate_ratios.append(stats.duplicate_ratio)
+
+
+CHEAP_COV_HEURISTICS: dict[str, str] = {
+    "run2": "a signed letter repeats consecutively at least twice",
+    "run3": "a signed letter repeats consecutively at least three times",
+    "signed_count2": "a signed letter occurs at least twice",
+    "dominant_letter50": "one signed letter occupies at least 50% of a relator",
+    "dominant_generator70": "one generator occupies at least 70% of a relator",
+    "generator_imbalance3": "generator counts differ by at least three",
+    "few_syllables3": "a relator has at most three generator syllables",
+    "low_syllable_ratio50": "generator syllables are at most 50% of relator length",
+    "few_distinct2": "a relator uses at most two signed letters",
+    "mixed_orientation": "a generator occurs in both orientations",
+    "long_relator12": "a relator has length at least 12",
+    "total_length16": "the presentation has total length at least 16",
+    "length_imbalance5": "relator lengths differ by at least five",
+    "single_generator": "a relator uses only one generator",
+    "one_many2": "one generator occurs once and another at least twice",
+    "one_many3": "one generator occurs once and another at least three times",
+    "short_side1": "one relator has length one",
+    "power_around": "an isolated generator is surrounded by a power of the other",
+    "same_isolated": "the same generator occurs once in each relator",
+    "repeated_bigram": "a cyclic bigram repeats within a relator",
+    "repeated_trigram": "a cyclic trigram repeats within a relator",
+    "periodic_1_3": "a relator is periodic with period at most three",
+    "cross_repeat": "the relators share a cyclic bigram",
+    "inverse_repeat": "a cyclic bigram and its inverse both occur",
+    "window_repeat": "a valid-length cyclic window repeats",
+    "delete1": "deleting one cyclic letter makes the relators equal",
+    "delete_block2": "deleting a cyclic block of at most two makes relators equal",
+    "histogram1": "signed-letter histograms have L1 distance at most one",
+    "histogram2": "signed-letter histograms have L1 distance at most two",
+    "length_difference1": "relator lengths differ by at most one",
+    "common_prefix2": "canonical relators share a two-letter prefix",
+    "common_suffix2": "canonical relators share a two-letter suffix",
+    "common_cyclic2": "relators share a cyclic subword of length two",
+    "common_cyclic3": "relators share a cyclic subword of length three",
+    "complement_match": "a COV complement equals the other relator",
+    "complement_overlap": "a COV complement overlaps at least 75% with the other relator",
+    "few_subs4": "at most four substitution actions are available",
+    "few_subs8": "at most eight substitution actions are available",
+    "no_subs": "no substitution action is available",
+    "few_unique_subs4": "at most four unique valid substitution successors exist",
+    "sub_duplicates50": "at least 50% of valid substitution successors duplicate",
+    "sub_duplicates80": "at least 80% of valid substitution successors duplicate",
+    "no_short_sub": "no substitution successor shortens total length",
+    "no_new_sub": "no new substitution successor is accepted",
+    "stagnate10": "best total length has not improved for 10 expanded nodes",
+    "stagnate30": "best total length has not improved for 30 expanded nodes",
+    "stagnate50": "best total length has not improved for 50 expanded nodes",
+    "stagnate70": "best total length has not improved for 70 expanded nodes",
+    "stagnate100": "best total length has not improved for 100 expanded nodes",
+    "plateau30": "30 consecutive popped states have the same total length",
+    "no_accepted10": "10 consecutive expansions accepted no ordinary successor",
+    "no_accepted30": "30 consecutive expansions accepted no ordinary successor",
+    "duplicate_streak80": "recent substitution duplicate ratio averages at least 80%",
+    "length_growth2": "current total length is at least two above the initial length",
+    "length_growth4": "current total length is at least four above the initial length",
+    "depth10": "search depth is at least 10",
+    "depth20": "search depth is at least 20",
+    "budget25": "at least 25% of the node budget has been consumed",
+    "budget50": "at least 50% of the node budget has been consumed",
+    "pulse50_5": "enable COV for five nodes out of every 50",
+    "relator_stuck10": "relator-length signature is unchanged for 10 popped states",
+    "relator_stuck30": "relator-length signature is unchanged for 30 popped states",
+    "oscillation": "recent total lengths alternate between two values",
+    "stagnate50_cooldown30": "after stagnation 50, retry COV every 30 nodes",
+}
+
+CHEAP_COV_REFERENCE_LABELS = ("baseline", "always_cov")
+CHEAP_COV_ALL_LABELS = CHEAP_COV_REFERENCE_LABELS + tuple(CHEAP_COV_HEURISTICS)
+CHEAP_COV_ACTION_INSPECTION_LABELS = {"complement_match", "complement_overlap"}
 
 
 def parse_word(text: str) -> list[int]:
@@ -545,6 +713,325 @@ def iter_actions(
         yield from iter_ac45_actions(key, max_n_gen, change_of_variables_moves)
 
 
+def cyclic_windows(word: Sequence[int], length: int) -> set[tuple[int, ...]]:
+    word = tuple(int(code) for code in word)
+    if length <= 0 or length > len(word):
+        return set()
+    return {
+        tuple(word[(start + offset) % len(word)] for offset in range(length))
+        for start in range(len(word))
+    }
+
+
+def max_signed_run(word: Sequence[int]) -> int:
+    if not word:
+        return 0
+    best = run = 1
+    for previous, current in zip(word, word[1:]):
+        run = run + 1 if current == previous else 1
+        best = max(best, run)
+    if len(word) > 1 and word[0] == word[-1]:
+        prefix = 1
+        while prefix < len(word) and word[prefix] == word[0]:
+            prefix += 1
+        suffix = 1
+        while suffix < len(word) and word[-suffix - 1] == word[-1]:
+            suffix += 1
+        best = min(len(word), max(best, prefix + suffix))
+    return best
+
+
+def generator_syllable_count(word: Sequence[int]) -> int:
+    if not word:
+        return 0
+    return 1 + sum(
+        abs(int(previous)) != abs(int(current))
+        for previous, current in zip(word, word[1:])
+    )
+
+
+def is_periodic(word: Sequence[int], max_period: int) -> bool:
+    word = tuple(word)
+    for period in range(1, min(max_period, len(word) // 2) + 1):
+        if len(word) % period == 0 and word == word[:period] * (len(word) // period):
+            return True
+    return False
+
+
+def cyclic_delete_matches(
+    longer: Sequence[int], shorter: Sequence[int], max_delete: int
+) -> bool:
+    longer = tuple(longer)
+    shorter_canon = canonical_word(shorter, 2)
+    delete_count = len(longer) - len(shorter)
+    if delete_count < 1 or delete_count > max_delete:
+        return False
+    for start in range(len(longer)):
+        kept = tuple(
+            longer[(start + delete_count + offset) % len(longer)]
+            for offset in range(len(longer) - delete_count)
+        )
+        if canonical_word(kept, 2) == shorter_canon:
+            return True
+    return False
+
+
+def histogram_distance(left: Sequence[int], right: Sequence[int]) -> int:
+    left_counts = Counter(int(code) for code in left)
+    right_counts = Counter(int(code) for code in right)
+    return sum(
+        abs(left_counts[code] - right_counts[code])
+        for code in left_counts.keys() | right_counts.keys()
+    )
+
+
+def longest_cyclic_overlap(left: Sequence[int], right: Sequence[int]) -> int:
+    for length in range(min(len(left), len(right)), 0, -1):
+        if cyclic_windows(left, length) & cyclic_windows(right, length):
+            return length
+    return 0
+
+
+def cov_action_complement(
+    key: StateKey, action: Action, max_n_gen: int
+) -> tuple[int, tuple[int, ...]] | None:
+    cov_branch = action[0] - num_substitution_branches(max_n_gen)
+    if cov_branch < 0 or cov_branch >= num_change_of_variables_branches(max_n_gen):
+        return None
+    iso_relator = cov_branch % max_n_gen
+    if iso_relator >= key[0]:
+        return None
+    complement = cyclic_subword_complement(
+        key[1][iso_relator], action[2], action[3] + 1
+    )
+    return iso_relator, complement
+
+
+def cheap_cov_should_enable(
+    label: str,
+    key: StateKey,
+    context: CheapCovContext,
+    substitutions: ExpansionStats,
+    cov_actions: Sequence[Action] = (),
+    max_n_gen: int = 2,
+    cov_window_min_length: int = 1,
+    cov_window_max_length: int | None = None,
+    cov_window_relator_margin: int = 1,
+) -> bool:
+    """Evaluate one cheap COV gate without constructing any COV successor."""
+    if label not in CHEAP_COV_HEURISTICS:
+        raise ValueError(f"unknown cheap COV heuristic {label!r}")
+
+    relators = key[1]
+    lengths = [len(word) for word in relators]
+    signed_counts = [Counter(word) for word in relators]
+    generator_counts = [
+        Counter(abs(int(code)) for code in word) for word in relators
+    ]
+
+    if label.startswith("run"):
+        threshold = int(label.removeprefix("run"))
+        return any(max_signed_run(word) >= threshold for word in relators)
+    if label.startswith("signed_count"):
+        threshold = int(label.removeprefix("signed_count"))
+        return any(
+            max(counts.values(), default=0) >= threshold
+            for counts in signed_counts
+        )
+    if label == "dominant_letter50":
+        return any(
+            counts and max(counts.values()) * 2 >= len(word)
+            for word, counts in zip(relators, signed_counts)
+        )
+    if label == "dominant_generator70":
+        return any(
+            counts and 10 * max(counts.values()) >= 7 * len(word)
+            for word, counts in zip(relators, generator_counts)
+        )
+    if label == "generator_imbalance3":
+        return any(
+            counts
+            and max(counts.values(), default=0) - min(
+                (counts.get(code, 0) for code in range(1, key[0] + 1)),
+                default=0,
+            ) >= 3
+            for counts in generator_counts
+        )
+    if label == "few_syllables3":
+        return any(1 < len(word) and generator_syllable_count(word) <= 3
+                   for word in relators)
+    if label == "low_syllable_ratio50":
+        return any(
+            len(word) > 1 and 2 * generator_syllable_count(word) <= len(word)
+            for word in relators
+        )
+    if label == "few_distinct2":
+        return any(len(word) > 1 and len(set(word)) <= 2 for word in relators)
+    if label == "mixed_orientation":
+        return any(
+            any(code in counts and -code in counts for code in range(1, key[0] + 1))
+            for counts in signed_counts
+        )
+    if label == "long_relator12":
+        return max(lengths, default=0) >= 12
+    if label == "total_length16":
+        return sum(lengths) >= 16
+    if label == "length_imbalance5":
+        return bool(lengths) and max(lengths) - min(lengths) >= 5
+    if label == "single_generator":
+        return any(len(word) > 1 and len(counts) == 1
+                   for word, counts in zip(relators, generator_counts))
+    if label in {"one_many2", "one_many3"}:
+        threshold = int(label.removeprefix("one_many"))
+        return any(
+            1 in counts.values() and max(counts.values(), default=0) >= threshold
+            for counts in generator_counts
+        )
+    if label == "short_side1":
+        return any(length == 1 for length in lengths)
+    if label == "power_around":
+        for word, counts in zip(relators, generator_counts):
+            for position, code in enumerate(word):
+                if counts[abs(code)] != 1 or len(word) < 3:
+                    continue
+                left = abs(word[position - 1])
+                right = abs(word[(position + 1) % len(word)])
+                if left == right and left != abs(code):
+                    return True
+        return False
+    if label == "same_isolated":
+        return any(
+            all(counts.get(generator, 0) == 1 for counts in generator_counts)
+            for generator in range(1, key[0] + 1)
+        )
+    if label in {"repeated_bigram", "repeated_trigram"}:
+        length = 2 if label.endswith("bigram") else 3
+        return any(
+            len(cyclic_windows(word, length)) < len(word)
+            for word in relators if len(word) >= length
+        )
+    if label == "periodic_1_3":
+        return any(is_periodic(word, 3) for word in relators)
+    if label == "cross_repeat":
+        return (
+            len(relators) >= 2
+            and bool(cyclic_windows(relators[0], 2) & cyclic_windows(relators[1], 2))
+        )
+    if label == "inverse_repeat":
+        windows = set().union(*(cyclic_windows(word, 2) for word in relators))
+        return any(inverse_word(window) in windows for window in windows)
+    if label == "window_repeat":
+        for word in relators:
+            max_window = len(word) - cov_window_relator_margin
+            if cov_window_max_length is not None:
+                max_window = min(max_window, cov_window_max_length)
+            for length in range(cov_window_min_length, max_window + 1):
+                if len(cyclic_windows(word, length)) < len(word):
+                    return True
+        return False
+    if label in {"delete1", "delete_block2"} and len(relators) >= 2:
+        max_delete = 1 if label == "delete1" else 2
+        left, right = sorted(relators[:2], key=len, reverse=True)
+        return cyclic_delete_matches(left, right, max_delete)
+    if label.startswith("histogram") and len(relators) >= 2:
+        threshold = int(label.removeprefix("histogram"))
+        return histogram_distance(relators[0], relators[1]) <= threshold
+    if label == "length_difference1":
+        return len(lengths) >= 2 and abs(lengths[0] - lengths[1]) <= 1
+    if label == "common_prefix2":
+        return (
+            len(relators) >= 2
+            and min(len(relators[0]), len(relators[1])) >= 2
+            and relators[0][:2] == relators[1][:2]
+        )
+    if label == "common_suffix2":
+        return (
+            len(relators) >= 2
+            and min(len(relators[0]), len(relators[1])) >= 2
+            and relators[0][-2:] == relators[1][-2:]
+        )
+    if label in {"common_cyclic2", "common_cyclic3"}:
+        length = int(label.removeprefix("common_cyclic"))
+        return (
+            len(relators) >= 2
+            and bool(
+                cyclic_windows(relators[0], length)
+                & cyclic_windows(relators[1], length)
+            )
+        )
+    if label in CHEAP_COV_ACTION_INSPECTION_LABELS:
+        for action in cov_actions:
+            decoded = cov_action_complement(key, action, max_n_gen)
+            if decoded is None:
+                continue
+            iso_relator, complement = decoded
+            for other_idx, other in enumerate(relators):
+                if other_idx == iso_relator or not complement or not other:
+                    continue
+                if label == "complement_match":
+                    if canonical_word(complement, key[0]) == canonical_word(
+                        other, key[0]
+                    ):
+                        return True
+                elif (
+                    longest_cyclic_overlap(complement, other)
+                    * 4
+                    >= 3 * min(len(complement), len(other))
+                ):
+                    return True
+        return False
+    if label.startswith("few_subs"):
+        return substitutions.action_count <= int(label.removeprefix("few_subs"))
+    if label == "no_subs":
+        return substitutions.action_count == 0
+    if label.startswith("few_unique_subs"):
+        threshold = int(label.removeprefix("few_unique_subs"))
+        return substitutions.unique_successor_count <= threshold
+    if label.startswith("sub_duplicates"):
+        percent = int(label.removeprefix("sub_duplicates"))
+        return substitutions.duplicate_ratio * 100 >= percent
+    if label == "no_short_sub":
+        return substitutions.shortening_successor_count == 0
+    if label == "no_new_sub":
+        return substitutions.new_successor_count == 0
+    if label.startswith("stagnate") and label != "stagnate50_cooldown30":
+        threshold = int(label.removeprefix("stagnate"))
+        return context.nodes_since_improvement >= threshold
+    if label == "plateau30":
+        return context.plateau_nodes >= 30
+    if label.startswith("no_accepted"):
+        threshold = int(label.removeprefix("no_accepted"))
+        return context.no_accepted_nodes >= threshold
+    if label == "duplicate_streak80":
+        ratios = context.recent_duplicate_ratios
+        return len(ratios) == 10 and sum(ratios) / len(ratios) >= 0.8
+    if label.startswith("length_growth"):
+        threshold = int(label.removeprefix("length_growth"))
+        return context.priority >= context.initial_length + threshold
+    if label.startswith("depth"):
+        return context.depth >= int(label.removeprefix("depth"))
+    if label.startswith("budget"):
+        percent = int(label.removeprefix("budget"))
+        return context.node * 100 >= percent * context.max_nodes
+    if label == "pulse50_5":
+        return (context.node - 1) % 50 < 5
+    if label.startswith("relator_stuck"):
+        threshold = int(label.removeprefix("relator_stuck"))
+        return context.relator_stuck_nodes >= threshold
+    if label == "oscillation":
+        history = context.recent_priorities
+        return (
+            len(history) >= 4
+            and history[-1] == history[-3]
+            and history[-2] == history[-4]
+            and history[-1] != history[-2]
+        )
+    if label == "stagnate50_cooldown30":
+        stagnant = context.nodes_since_improvement
+        return stagnant >= 50 and (stagnant - 50) % 30 == 0
+    raise AssertionError(f"unimplemented cheap COV heuristic {label!r}")
+
+
 def build_apply_batch(
     params: MoveParams, change_of_variables_moves: bool, ac45_moves: bool
 ):
@@ -654,6 +1141,7 @@ class GreedyNSolver:
         cov_window_min_length: int = 1,
         cov_window_max_length: int | None = None,
         cov_window_relator_margin: int = 1,
+        cheap_cov_label: str | None = None,
     ):
         self.max_n_gen = max_n_gen
         self.max_length = max_length
@@ -666,6 +1154,7 @@ class GreedyNSolver:
         self.cov_window_min_length = cov_window_min_length
         self.cov_window_max_length = cov_window_max_length
         self.cov_window_relator_margin = cov_window_relator_margin
+        self.cheap_cov_label = cheap_cov_label
         self.chunk_size = chunk_size
         self.verbose = verbose
         self.original_relators = tuple(
@@ -679,6 +1168,15 @@ class GreedyNSolver:
             raise ValueError("--seeded_cov_moves requires max_n_gen >= n_gen + 1")
         if seeded_cov_moves and not change_of_variables_moves:
             raise ValueError("seeded COV requires ordinary COV support")
+        if cheap_cov_label is not None:
+            if cheap_cov_label not in CHEAP_COV_HEURISTICS:
+                raise ValueError(f"unknown cheap COV heuristic {cheap_cov_label!r}")
+            if not change_of_variables_moves:
+                raise ValueError("cheap COV heuristics require ordinary COV support")
+            if seeded_cov_moves or ac45_moves:
+                raise ValueError(
+                    "cheap COV heuristics cannot be combined with seeded COV or AC4/AC5"
+                )
 
         self.initial_key, self.initial_flat = canonicalize_flat(
             initial_flat, n_gen, max_n_gen, max_length
@@ -726,6 +1224,16 @@ class GreedyNSolver:
         nodes_visited = 0
         max_priority_seen = state_total_length(self.initial_key)
         min_priority_seen = state_total_length(self.initial_key)
+        cheap_tracker = (
+            CheapCovTracker(
+                initial_length=state_total_length(self.initial_key),
+                best_length=state_total_length(self.initial_key),
+            )
+            if self.cheap_cov_label is not None else None
+        )
+        cheap_gate_checks = 0
+        cheap_triggered_states = 0
+        cheap_actions_enumerated = 0
 
         while pq and nodes_visited < self.max_nodes:
             priority, depth, _, key = heapq.heappop(pq)
@@ -776,39 +1284,126 @@ class GreedyNSolver:
                         self.seeded_frontier.trivial_stabilization_key
                         if self.seeded_frontier is not None else None
                     ),
+                    cheap_cov_label=self.cheap_cov_label,
+                    cheap_cov_gate_checks=cheap_gate_checks,
+                    cheap_cov_triggered_states=cheap_triggered_states,
+                    cheap_cov_actions_enumerated=cheap_actions_enumerated,
                 )
 
             if self.max_depth is not None and depth >= self.max_depth:
                 continue
 
-            action_list = list(
-                iter_actions(
-                    key,
-                    self.max_n_gen,
-                    self.change_of_variables_moves,
-                    self.ac45_moves,
-                    self.cov_window_min_length,
-                    self.cov_window_max_length,
-                    self.cov_window_relator_margin,
-                )
-            )
             flat = flats[key]
-            for action, next_flat, next_n_gen in apply_actions_chunked(
-                self.apply_batch, flat, active_n_gen, action_list, self.chunk_size
-            ):
-                next_key, next_canon_flat = canonicalize_flat(
-                    next_flat, next_n_gen, self.max_n_gen, self.max_length
-                )
-                if next_key == key or next_key in parents:
-                    continue
-                total_length = state_total_length(next_key)
-                if total_length > self.max_total_length:
-                    continue
 
-                parents[next_key] = (key, action)
-                flats[next_key] = next_canon_flat
-                seq += 1
-                heapq.heappush(pq, (total_length, depth + 1, seq, next_key))
+            def enqueue_actions(
+                action_list: Sequence[Action],
+            ) -> ExpansionStats:
+                nonlocal seq
+                valid_count = 0
+                duplicate_count = 0
+                new_count = 0
+                valid_keys: set[StateKey] = set()
+                shortening_keys: set[StateKey] = set()
+                for action, next_flat, next_n_gen in apply_actions_chunked(
+                    self.apply_batch,
+                    flat,
+                    active_n_gen,
+                    action_list,
+                    self.chunk_size,
+                ):
+                    next_key, next_canon_flat = canonicalize_flat(
+                        next_flat, next_n_gen, self.max_n_gen, self.max_length
+                    )
+                    if next_key == key:
+                        continue
+                    total_length = state_total_length(next_key)
+                    if total_length > self.max_total_length:
+                        continue
+                    valid_count += 1
+                    valid_keys.add(next_key)
+                    if total_length < priority:
+                        shortening_keys.add(next_key)
+                    if next_key in parents:
+                        duplicate_count += 1
+                        continue
+
+                    parents[next_key] = (key, action)
+                    flats[next_key] = next_canon_flat
+                    seq += 1
+                    new_count += 1
+                    heapq.heappush(pq, (total_length, depth + 1, seq, next_key))
+                return ExpansionStats(
+                    action_count=len(action_list),
+                    valid_successor_count=valid_count,
+                    unique_successor_count=len(valid_keys),
+                    new_successor_count=new_count,
+                    duplicate_successor_count=duplicate_count,
+                    shortening_successor_count=len(shortening_keys),
+                )
+
+            if self.cheap_cov_label is None:
+                action_list = list(
+                    iter_actions(
+                        key,
+                        self.max_n_gen,
+                        self.change_of_variables_moves,
+                        self.ac45_moves,
+                        self.cov_window_min_length,
+                        self.cov_window_max_length,
+                        self.cov_window_relator_margin,
+                    )
+                )
+                enqueue_actions(action_list)
+                continue
+
+            if cheap_tracker is None:
+                raise AssertionError("cheap COV tracker was not initialized")
+            context = cheap_tracker.observe_pop(
+                key, nodes_visited, depth, self.max_nodes
+            )
+            substitution_actions = list(
+                iter_substitution_actions(key, self.max_n_gen)
+            )
+            substitution_stats = enqueue_actions(substitution_actions)
+            cov_actions: list[Action] = []
+            if self.cheap_cov_label in CHEAP_COV_ACTION_INSPECTION_LABELS:
+                cov_actions = list(
+                    iter_change_of_variables_actions(
+                        key,
+                        self.max_n_gen,
+                        self.cov_window_min_length,
+                        self.cov_window_max_length,
+                        self.cov_window_relator_margin,
+                    )
+                )
+                cheap_actions_enumerated += len(cov_actions)
+            cheap_gate_checks += 1
+            use_cov = cheap_cov_should_enable(
+                self.cheap_cov_label,
+                key,
+                context,
+                substitution_stats,
+                cov_actions,
+                self.max_n_gen,
+                self.cov_window_min_length,
+                self.cov_window_max_length,
+                self.cov_window_relator_margin,
+            )
+            if use_cov:
+                cheap_triggered_states += 1
+                if not cov_actions:
+                    cov_actions = list(
+                        iter_change_of_variables_actions(
+                            key,
+                            self.max_n_gen,
+                            self.cov_window_min_length,
+                            self.cov_window_max_length,
+                            self.cov_window_relator_margin,
+                        )
+                    )
+                    cheap_actions_enumerated += len(cov_actions)
+                enqueue_actions(cov_actions)
+            cheap_tracker.observe_expansion(substitution_stats)
 
         elapsed = time.time() - start_time
         return SearchResult(
@@ -836,6 +1431,10 @@ class GreedyNSolver:
                 self.seeded_frontier.trivial_stabilization_key
                 if self.seeded_frontier is not None else None
             ),
+            cheap_cov_label=self.cheap_cov_label,
+            cheap_cov_gate_checks=cheap_gate_checks,
+            cheap_cov_triggered_states=cheap_triggered_states,
+            cheap_cov_actions_enumerated=cheap_actions_enumerated,
         )
 
     @staticmethod
@@ -1073,6 +1672,17 @@ def result_payload(result: SearchResult, idx: int | None = None) -> dict:
             ),
             "solution": seeded_cov_solution_metadata(result),
         }
+    if result.cheap_cov_label is not None:
+        payload["cheap_cov"] = {
+            "label": result.cheap_cov_label,
+            "gate_checks": result.cheap_cov_gate_checks,
+            "triggered_states": result.cheap_cov_triggered_states,
+            "actions_enumerated": result.cheap_cov_actions_enumerated,
+            "trigger_rate": (
+                result.cheap_cov_triggered_states / result.cheap_cov_gate_checks
+                if result.cheap_cov_gate_checks else 0.0
+            ),
+        }
     if idx is not None:
         payload["idx"] = idx
     return payload
@@ -1115,6 +1725,8 @@ def init_wandb_run(
         "stable_ac_moves": args.stable_ac_moves,
         "compare_cov": args.compare_cov,
         "compare_cov_paths": args.compare_cov_paths,
+        "cheap_cov_experiments": args.cheap_cov_experiments,
+        "cheap_cov_labels": args.cheap_cov_labels,
         "batch_mode": batch_mode,
         "wandb_window": args.wandb_window,
         "wandb_log_every": args.wandb_log_every,
@@ -1122,12 +1734,16 @@ def init_wandb_run(
         "wandb_table": args.wandb_table,
     }
     name = args.wandb_run_name or None
-    tags = args.wandb_tags if args.wandb_tags else None
+    tags = list(args.wandb_tags)
+    if args.cheap_cov_experiments:
+        for tag in ("cheap", "cheap_cov"):
+            if tag not in tags:
+                tags.append(tag)
     return wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity or None,
         name=name,
-        tags=tags,
+        tags=tags or None,
         config=config,
         mode=args.wandb_mode,
     )
@@ -1220,6 +1836,7 @@ def make_solver(
     ac45_moves: bool,
     verbose: bool,
     apply_batch=None,
+    cheap_cov_label: str | None = None,
 ) -> GreedyNSolver:
     return GreedyNSolver(
         initial_flat=initial_flat,
@@ -1238,6 +1855,7 @@ def make_solver(
         chunk_size=args.chunk_size,
         verbose=verbose,
         apply_batch=apply_batch,
+        cheap_cov_label=cheap_cov_label,
     )
 
 
@@ -1248,6 +1866,7 @@ def solve_dataset_row(
     ac45_moves: bool,
     apply_batch_cache: dict,
     verbose: bool = False,
+    cheap_cov_label: str | None = None,
 ) -> SearchResult:
     cache_key = (
         row.max_n_gen,
@@ -1275,6 +1894,7 @@ def solve_dataset_row(
         ac45_moves,
         verbose=verbose,
         apply_batch=apply_batch_cache[cache_key],
+        cheap_cov_label=cheap_cov_label,
     )
     return solver.solve()
 
@@ -1736,6 +2356,257 @@ def run_cov_comparison(args: argparse.Namespace, ac45_moves: bool) -> None:
         print("WITHOUT_COV_ONLY_INDICES", without_cov_only_indices)
 
 
+def resolve_cheap_cov_labels(requested: Sequence[str] | None) -> list[str]:
+    if not requested or requested == ["all"]:
+        return list(CHEAP_COV_ALL_LABELS)
+    labels: list[str] = []
+    for raw_label in requested:
+        for label in raw_label.split(","):
+            label = label.strip()
+            if not label:
+                continue
+            if label == "all":
+                raise ValueError("'all' cannot be combined with explicit labels")
+            if label not in CHEAP_COV_ALL_LABELS:
+                raise ValueError(
+                    f"unknown cheap COV label {label!r}; choose from "
+                    + ", ".join(CHEAP_COV_ALL_LABELS)
+                )
+            if label not in labels:
+                labels.append(label)
+    if not labels:
+        raise ValueError("at least one cheap COV label is required")
+    return labels
+
+
+def cheap_cov_description(label: str) -> str:
+    if label == "baseline":
+        return "ordinary substitution moves only"
+    if label == "always_cov":
+        return "ordinary substitution and COV moves at every expanded state"
+    return CHEAP_COV_HEURISTICS[label]
+
+
+def run_cheap_cov_experiments(args: argparse.Namespace) -> None:
+    if args.dataset is None:
+        raise SystemExit("--cheap_cov_experiments requires --dataset")
+    start = args.start
+    if start is None:
+        start = 0 if args.all or args.end is not None else args.idx
+    end = args.end
+    if end is None and not args.all:
+        end = start + 1
+    if start < 0:
+        raise SystemExit("--start/--idx must be non-negative")
+    if end is not None and end <= start:
+        raise SystemExit("--end must be greater than the first index")
+
+    try:
+        labels = resolve_cheap_cov_labels(args.cheap_cov_labels)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    out_jsonl = args.out_jsonl or args.out_json
+    if out_jsonl is None:
+        out_jsonl = os.path.join(
+            REPO_ROOT, "results", f"cheap_cov_{args.dataset}.jsonl"
+        )
+    out_dir = os.path.dirname(os.path.abspath(out_jsonl))
+    os.makedirs(out_dir, exist_ok=True)
+
+    wandb_run = init_wandb_run(
+        args,
+        change_of_variables_moves=True,
+        ac45_moves=False,
+        batch_mode=True,
+    )
+    apply_batch_cache: dict = {}
+    aggregates = {
+        label: {
+            "processed": 0,
+            "solved": 0,
+            "nodes": 0,
+            "elapsed_sec": 0.0,
+            "triggered_states": 0,
+            "gate_checks": 0,
+        }
+        for label in labels
+    }
+    table_rows: list[list] = []
+    total_rows = 0
+    total_searches = 0
+    t0 = time.time()
+
+    print(
+        f"CHEAP_COV suite labels={len(labels)} output={out_jsonl}",
+        flush=True,
+    )
+    if len(labels) > 20 and not args.quiet:
+        print(
+            "Running every label performs "
+            f"{len(labels)} independent searches per presentation.",
+            flush=True,
+        )
+
+    try:
+        with open(out_jsonl, "w") as out_handle:
+            for row in iter_dataset_rows(
+                args.dataset,
+                start,
+                end,
+                args.n_gen,
+                args.max_n_gen,
+                args.max_length,
+            ):
+                if row.n_gen != 2:
+                    raise SystemExit(
+                        "--cheap_cov_experiments currently requires rank-two rows"
+                    )
+                total_rows += 1
+                wandb_metrics: dict[str, float | int] = {
+                    "idx": row.idx,
+                    "processed_rows": total_rows,
+                }
+                for label in labels:
+                    if label == "baseline":
+                        cov_enabled = False
+                        gate_label = None
+                    elif label == "always_cov":
+                        cov_enabled = True
+                        gate_label = None
+                    else:
+                        cov_enabled = True
+                        gate_label = label
+
+                    result = solve_dataset_row(
+                        row,
+                        args,
+                        change_of_variables_moves=cov_enabled,
+                        ac45_moves=False,
+                        apply_batch_cache=apply_batch_cache,
+                        cheap_cov_label=gate_label,
+                    )
+                    total_searches += 1
+                    aggregate = aggregates[label]
+                    aggregate["processed"] += 1
+                    aggregate["solved"] += int(result.solved)
+                    aggregate["nodes"] += result.nodes_visited
+                    aggregate["elapsed_sec"] += result.elapsed_sec
+                    aggregate["triggered_states"] += result.cheap_cov_triggered_states
+                    aggregate["gate_checks"] += result.cheap_cov_gate_checks
+                    solve_rate = aggregate["solved"] / aggregate["processed"]
+                    depth = len(result.path_actions) if result.solved else -1
+
+                    payload = result_payload(result, idx=row.idx)
+                    payload.update(
+                        {
+                            "suite": "cheap_cov",
+                            "experiment_group": "cheap",
+                            "heuristic": label,
+                            "heuristic_description": cheap_cov_description(label),
+                            "processed_for_heuristic": aggregate["processed"],
+                            "num_solved_for_heuristic": aggregate["solved"],
+                            "solve_rate_for_heuristic": solve_rate,
+                        }
+                    )
+                    json.dump(payload, out_handle)
+                    out_handle.write("\n")
+                    out_handle.flush()
+
+                    table_rows.append(
+                        [
+                            row.idx,
+                            label,
+                            bool(result.solved),
+                            depth,
+                            result.nodes_visited,
+                            result.seen_count,
+                            result.elapsed_sec,
+                            result.cheap_cov_triggered_states,
+                            result.cheap_cov_gate_checks,
+                        ]
+                    )
+                    prefix = f"cheap_cov/{label}"
+                    wandb_metrics[f"{prefix}/solved"] = int(result.solved)
+                    wandb_metrics[f"{prefix}/solve_rate"] = solve_rate
+                    wandb_metrics[f"{prefix}/path_length"] = depth
+                    wandb_metrics[f"{prefix}/nodes_visited"] = result.nodes_visited
+                    wandb_metrics[f"{prefix}/triggered_states"] = (
+                        result.cheap_cov_triggered_states
+                    )
+
+                    if not args.quiet:
+                        status = "SOLVED" if result.solved else "not solved"
+                        print(
+                            f"[{row.idx}][{label}] {status} depth={depth} "
+                            f"nodes={result.nodes_visited} "
+                            f"triggered={result.cheap_cov_triggered_states}/"
+                            f"{result.cheap_cov_gate_checks} "
+                            f"rate={solve_rate:.3f}",
+                            flush=True,
+                        )
+
+                if (
+                    wandb_run is not None
+                    and total_rows % args.wandb_log_every == 0
+                ):
+                    wandb_run.log(wandb_metrics, step=total_rows)
+    finally:
+        elapsed = time.time() - t0
+
+    if wandb_run is not None:
+        wandb_run.summary["suite"] = "cheap_cov"
+        wandb_run.summary["experiment_group"] = "cheap"
+        wandb_run.summary["processed_rows"] = total_rows
+        wandb_run.summary["total_searches"] = total_searches
+        wandb_run.summary["elapsed_sec"] = elapsed
+        for label, aggregate in aggregates.items():
+            processed = aggregate["processed"]
+            prefix = f"cheap_cov/{label}"
+            wandb_run.summary[f"{prefix}/num_solved"] = aggregate["solved"]
+            wandb_run.summary[f"{prefix}/solve_rate"] = (
+                aggregate["solved"] / processed if processed else 0.0
+            )
+            wandb_run.summary[f"{prefix}/total_nodes"] = aggregate["nodes"]
+            wandb_run.summary[f"{prefix}/elapsed_sec"] = aggregate["elapsed_sec"]
+            wandb_run.summary[f"{prefix}/triggered_states"] = (
+                aggregate["triggered_states"]
+            )
+            wandb_run.summary[f"{prefix}/gate_checks"] = aggregate["gate_checks"]
+        maybe_log_wandb_table(
+            wandb_run,
+            "cheap_cov/results",
+            [
+                "idx",
+                "heuristic",
+                "solved",
+                "path_length",
+                "nodes_visited",
+                "seen_count",
+                "elapsed_sec",
+                "triggered_states",
+                "gate_checks",
+            ],
+            table_rows,
+            args.wandb_table,
+        )
+        wandb_run.finish()
+
+    print(
+        f"SUMMARY suite=cheap_cov rows={total_rows} labels={len(labels)} "
+        f"searches={total_searches} time={elapsed:.3f}s output={out_jsonl}"
+    )
+    for label, aggregate in aggregates.items():
+        processed = aggregate["processed"]
+        solve_rate = aggregate["solved"] / processed if processed else 0.0
+        print(
+            f"  {label}: solved={aggregate['solved']}/{processed} "
+            f"rate={solve_rate:.3f} nodes={aggregate['nodes']} "
+            f"triggered={aggregate['triggered_states']}/"
+            f"{aggregate['gate_checks']}"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="n-generator greedy best-first AC search"
@@ -1822,6 +2693,24 @@ def parse_args() -> argparse.Namespace:
             "in each JSONL row"
         ),
     )
+    parser.add_argument(
+        "--cheap_cov_experiments",
+        action="store_true",
+        help=(
+            "run the cheap COV heuristic suite, including substitution-only "
+            "and always-COV references"
+        ),
+    )
+    parser.add_argument(
+        "--cheap_cov_labels",
+        nargs="+",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "suite labels to run (space- or comma-separated); default: all. "
+            "References are baseline and always_cov"
+        ),
+    )
     parser.add_argument("--show_path", action="store_true")
     parser.add_argument("--print_packed", action="store_true")
     parser.add_argument("--out_json", default=None)
@@ -1881,6 +2770,7 @@ def effective_move_flags(args: argparse.Namespace) -> tuple[bool, bool]:
         args.change_of_variables_moves
         or args.stable_ac_moves
         or args.seeded_cov_moves
+        or getattr(args, "cheap_cov_experiments", False)
     )
     ac45_moves = bool(args.ac45_moves or args.stable_ac_moves)
     return change_of_variables_moves, ac45_moves
@@ -1948,7 +2838,7 @@ def main() -> None:
         or args.cov_window_relator_margin != 1
     )
     if custom_cov_window_bounds and not (
-        change_of_variables_moves or args.compare_cov
+        change_of_variables_moves or args.compare_cov or args.cheap_cov_experiments
     ):
         raise SystemExit(
             "custom COV window bounds require COV, seeded COV, "
@@ -1967,10 +2857,29 @@ def main() -> None:
         )
     if args.seeded_cov_moves and args.compare_cov:
         raise SystemExit("--seeded_cov_moves cannot be combined with --compare_cov")
+    if args.cheap_cov_experiments and (
+        args.seeded_cov_moves
+        or args.compare_cov
+        or args.change_of_variables_moves
+        or args.ac45_moves
+        or args.stable_ac_moves
+    ):
+        raise SystemExit(
+            "--cheap_cov_experiments is a complete method and cannot be combined "
+            "with seeded, comparison, explicit COV, or AC4/AC5 move flags"
+        )
+    if args.cheap_cov_labels is not None and not args.cheap_cov_experiments:
+        raise SystemExit("--cheap_cov_labels requires --cheap_cov_experiments")
+    if args.cheap_cov_experiments and (args.show_path or args.print_packed):
+        raise SystemExit(
+            "--show_path and --print_packed are not supported by the cheap COV suite"
+        )
     if args.relators is not None and (args.all or args.start is not None or args.end is not None):
         raise SystemExit("--all/--start/--end only apply with --dataset")
-    if args.compare_cov and args.relators is not None:
-        raise SystemExit("--compare_cov only applies with --dataset")
+    if (args.compare_cov or args.cheap_cov_experiments) and args.relators is not None:
+        raise SystemExit(
+            "--compare_cov and --cheap_cov_experiments only apply with --dataset"
+        )
     if args.compare_cov and args.dataset is None:
         raise SystemExit("--compare_cov requires --dataset")
     if args.out_jsonl is not None and args.dataset is None:
@@ -1979,11 +2888,20 @@ def main() -> None:
     ensure_seeded_cov_capacity(args)
 
     comparison_mode = args.compare_cov
+    cheap_cov_mode = args.cheap_cov_experiments
     batch_mode = args.dataset is not None and (
         args.all or args.start is not None or args.end is not None
     )
-    if args.out_jsonl is not None and not (batch_mode or comparison_mode):
-        raise SystemExit("--out_jsonl only applies with --all/--start/--end or --compare_cov")
+    if args.out_jsonl is not None and not (
+        batch_mode or comparison_mode or cheap_cov_mode
+    ):
+        raise SystemExit(
+            "--out_jsonl only applies with --all/--start/--end, --compare_cov, "
+            "or --cheap_cov_experiments"
+        )
+    if cheap_cov_mode:
+        run_cheap_cov_experiments(args)
+        return
     if comparison_mode:
         run_cov_comparison(args, ac45_moves)
         return
