@@ -347,6 +347,26 @@ CHEAP_COV_HEURISTICS: dict[str, str] = {
 CHEAP_COV_REFERENCE_LABELS = ("baseline", "always_cov")
 CHEAP_COV_ALL_LABELS = CHEAP_COV_REFERENCE_LABELS + tuple(CHEAP_COV_HEURISTICS)
 CHEAP_COV_ACTION_INSPECTION_LABELS = {"complement_match", "complement_overlap"}
+CHEAP_COV_PRESETS: dict[str, tuple[str, ...]] = {
+    "initial": (
+        "baseline",
+        "always_cov",
+        "run2",
+        "run3",
+        "one_many2",
+        "repeated_bigram",
+        "cross_repeat",
+        "delete1",
+        "histogram1",
+        "few_subs4",
+        "sub_duplicates80",
+        "no_short_sub",
+        "stagnate10",
+        "stagnate30",
+        "stagnate50",
+        "stagnate100",
+    ),
+}
 
 
 def parse_word(text: str) -> list[int]:
@@ -1727,6 +1747,7 @@ def init_wandb_run(
         "compare_cov_paths": args.compare_cov_paths,
         "cheap_cov_experiments": args.cheap_cov_experiments,
         "cheap_cov_labels": args.cheap_cov_labels,
+        "cheap_cov_preset": args.cheap_cov_preset,
         "batch_mode": batch_mode,
         "wandb_window": args.wandb_window,
         "wandb_log_every": args.wandb_log_every,
@@ -2356,7 +2377,16 @@ def run_cov_comparison(args: argparse.Namespace, ac45_moves: bool) -> None:
         print("WITHOUT_COV_ONLY_INDICES", without_cov_only_indices)
 
 
-def resolve_cheap_cov_labels(requested: Sequence[str] | None) -> list[str]:
+def resolve_cheap_cov_labels(
+    requested: Sequence[str] | None,
+    preset: str | None = None,
+) -> list[str]:
+    if preset is not None:
+        if requested:
+            raise ValueError(
+                "--cheap_cov_preset cannot be combined with --cheap_cov_labels"
+            )
+        return list(CHEAP_COV_PRESETS[preset])
     if not requested or requested == ["all"]:
         return list(CHEAP_COV_ALL_LABELS)
     labels: list[str] = []
@@ -2402,7 +2432,10 @@ def run_cheap_cov_experiments(args: argparse.Namespace) -> None:
         raise SystemExit("--end must be greater than the first index")
 
     try:
-        labels = resolve_cheap_cov_labels(args.cheap_cov_labels)
+        labels = resolve_cheap_cov_labels(
+            args.cheap_cov_labels,
+            args.cheap_cov_preset,
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -2711,6 +2744,12 @@ def parse_args() -> argparse.Namespace:
             "References are baseline and always_cov"
         ),
     )
+    parser.add_argument(
+        "--cheap_cov_preset",
+        choices=sorted(CHEAP_COV_PRESETS),
+        default=None,
+        help="curated cheap-COV label subset; use 'initial' for the first pass",
+    )
     parser.add_argument("--show_path", action="store_true")
     parser.add_argument("--print_packed", action="store_true")
     parser.add_argument("--out_json", default=None)
@@ -2870,6 +2909,12 @@ def main() -> None:
         )
     if args.cheap_cov_labels is not None and not args.cheap_cov_experiments:
         raise SystemExit("--cheap_cov_labels requires --cheap_cov_experiments")
+    if args.cheap_cov_preset is not None and not args.cheap_cov_experiments:
+        raise SystemExit("--cheap_cov_preset requires --cheap_cov_experiments")
+    if args.cheap_cov_preset is not None and args.cheap_cov_labels is not None:
+        raise SystemExit(
+            "--cheap_cov_preset cannot be combined with --cheap_cov_labels"
+        )
     if args.cheap_cov_experiments and (args.show_path or args.print_packed):
         raise SystemExit(
             "--show_path and --print_packed are not supported by the cheap COV suite"
